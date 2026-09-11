@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use std::net::Ipv4Addr;
 
 #[derive(Default)]
 pub struct Params(pub Vec<(String, String)>);
@@ -102,6 +101,10 @@ pub fn imei(p: &Params) -> Result<String> {
     }
     Ok(format!("AT+EGMR=1,7,\"{v}\";+CFUN=1,1"))
 }
+pub fn sim_switch(p: &Params) -> Result<String> {
+    Ok(format!("AT+QUIMSLOT={}", p.integer("slot", 1, 2)?))
+}
+
 pub fn network(p: &Params) -> Result<String> {
     Ok(match p.get("action") {
         "lock_bands" => format!(
@@ -186,79 +189,10 @@ pub fn network(p: &Params) -> Result<String> {
 }
 pub fn settings(p: &Params) -> Result<Vec<String>> {
     let action = p.get("action");
-    if action == "ip_passthrough" && !p.flag("enabled", true) {
-        return Ok(vec![
-            "AT+QMAP=\"MPDN_RULE\",0".into(),
-            "AT+QMAPWAC=1".into(),
-            "AT+CFUN=1,1".into(),
-        ]);
-    }
     let command = match action {
         "set_imei" => imei(p)?,
         "reboot" => "AT+CFUN=1,1".into(),
         "reset_at" => "AT&F".into(),
-        "manual_at" => {
-            let value = p.get("command").trim();
-            if value.is_empty() {
-                "ATI".into()
-            } else {
-                value.into()
-            }
-        }
-        "ip_passthrough" => {
-            let code = match p.get("mode").to_ascii_uppercase().as_str() {
-                "ETH" => 1,
-                "USB" => 3,
-                _ => bail!("invalid passthrough mode"),
-            };
-            format!("AT+QMAP=\"MPDN_RULE\",0,1,0,{code},1,\"FF:FF:FF:FF:FF:FF\"")
-        }
-        "dns_proxy" => {
-            let family = p.get("family");
-            if family != "4" && family != "6" {
-                bail!("invalid dns family")
-            }
-            format!(
-                "AT+QMAP=\"DHCPV{family}DNS\",\"{}\"",
-                if p.flag("enabled", false) {
-                    "enable"
-                } else {
-                    "disable"
-                }
-            )
-        }
-        "usbnet" => {
-            let code = match p.get("mode").to_ascii_uppercase().as_str() {
-                "RMNET" => 0,
-                "ECM" => 1,
-                "MBIM" => 2,
-                "RNDIS" => 3,
-                _ => bail!("invalid usbnet mode"),
-            };
-            format!("AT+QCFG=\"usbnet\",{code}")
-        }
-        "dmz" => {
-            if p.flag("enabled", false) {
-                format!(
-                    "AT+QMAP=\"DMZ\",1,4,{}",
-                    p.get("ip").parse::<Ipv4Addr>().context("invalid dmz ip")?
-                )
-            } else {
-                "AT+QMAP=\"DMZ\",0".into()
-            }
-        }
-        "lanip" => {
-            let mut ips = Vec::new();
-            for key in ["start", "end", "gateway"] {
-                ips.push(
-                    p.get(key)
-                        .parse::<Ipv4Addr>()
-                        .context("invalid lan ip")?
-                        .to_string(),
-                )
-            }
-            format!("AT+QMAP=\"LANIP\",{}", ips.join(","))
-        }
         _ => bail!("unsupported action"),
     };
     Ok(vec![command])

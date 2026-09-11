@@ -49,7 +49,7 @@ function cellLocking() {
         async requestCellLock(params) {
           this.lockBusy=true;this.lockMessage='';
           try {
-            const data=await SimpleAdmin.Api.networkData({persistence:this.lockPersistence,auto_unlock:this.lockAutoUnlock?'1':'0',...params});
+            const data=await SimpleAdmin.Api.networkData({persistence:this.lockPersistence,auto_unlock:this.lockAutoUnlock?'1':'0',confirm:'1',...params});
             if(data.ok===false) throw new Error(data.error||data.response||'锁频失败');
             this.lockRadios=data.cell_lock.radios;this.lockMessage=data.warning||SimpleAdmin.Lang.t('已保存');
             return data;
@@ -100,7 +100,7 @@ function cellLocking() {
           this.isLoading = true;
           this.isCellScanning = true;
 
-          SimpleAdmin.Api.networkData({ action: 'scan', mode: this.cellScanMode })
+          SimpleAdmin.Api.networkData({ action: 'scan', mode: this.cellScanMode, confirm: '1' })
             .then(data => {
               this.nr5g_cells_parsed = data.nr5g_cells_parsed || [];
               this.lte_cells_parsed = data.lte_cells_parsed || [];
@@ -561,7 +561,7 @@ function cellLocking() {
             alert("没有选中任何频段，请选择至少一个频段！");
             return;
           }
-          await SimpleAdmin.Api.networkData({ action: 'lock_bands', mode: selectedMode, values: newCheckedValues.join(':') });
+          await SimpleAdmin.Api.networkData({ action: 'lock_bands', mode: selectedMode, values: newCheckedValues.join(':'), confirm: '1' });
           this.invalidateLockedBands(selectedMode);
           await this.startModalCountdown(3);
           await Promise.all([
@@ -575,7 +575,7 @@ function cellLocking() {
         },
 
         async resetBandLocking() {
-          await SimpleAdmin.Api.networkData({ action: 'reset_bands', lte: this.lte_bands, nsa: this.nsa_bands, sa: this.sa_bands });
+          await SimpleAdmin.Api.networkData({ action: 'reset_bands', lte: this.lte_bands, nsa: this.nsa_bands, sa: this.sa_bands, confirm: '1' });
           this.locked_lte_bands = null;
           this.locked_nsa_bands = null;
           this.locked_sa_bands = null;
@@ -605,7 +605,7 @@ function cellLocking() {
             alert("没有做出更改");
             return;
           }
-
+          payload.confirm = '1';
           await SimpleAdmin.Api.networkData(payload);
           await this.startModalCountdown(3);
           //await this.getCurrentSettings();

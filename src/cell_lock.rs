@@ -8,7 +8,6 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -193,7 +192,7 @@ impl CellLock {
                     .transpose()?
                     .unwrap_or_else(|| format!("{}0", PREFIXES[radio]));
                 let _ = at.run(&restore).await;
-                at.invalidate().await;
+                let _ = at.invalidate().await;
                 bail!("cell lock settings save failed: {error}");
             }
         }
@@ -214,7 +213,7 @@ impl CellLock {
                 error: String::new(),
             };
         }
-        at.invalidate().await;
+        let _ = at.invalidate().await;
         self.changed.notify_one();
         Ok(json!({"ok":true,"response":response,"warning":warning,"cell_lock":self.snapshot()}))
     }
@@ -268,9 +267,13 @@ impl CellLock {
                 deadline: rule.auto_unlock.then(|| Instant::now() + GUARD),
             };
         }
-        at.invalidate().await;
+        let _ = at.invalidate().await;
     }
     async fn check(&self, at: &At) {
+        self.check_with_connected(at, crate::network_status::has_wan_address())
+            .await;
+    }
+    async fn check_with_connected(&self, at: &At, connected: bool) {
         let _guard = self.mutation.lock().await;
         if !self
             .state
@@ -282,12 +285,6 @@ impl CellLock {
         {
             return;
         }
-        // Query the modem's data session directly; DNS or an unreachable ping target is not a dial failure.
-        let connected = at
-            .run("AT+QMAP=\"WWAN\"")
-            .await
-            .ok()
-            .is_some_and(|raw| dialed(&raw));
         for (radio, prefix) in PREFIXES.iter().enumerate() {
             let deadline = self.state.lock().unwrap().runtime[radio].deadline;
             let Some(deadline) = deadline else {
@@ -313,7 +310,7 @@ impl CellLock {
                     .await
                     .ok()
                     .is_some_and(|raw| parser::ok(&raw));
-                at.invalidate().await;
+                let _ = at.invalidate().await;
                 let mut state = self.state.lock().unwrap();
                 let r = &mut state.runtime[radio];
                 if saved.is_ok() && unlocked {
@@ -332,27 +329,6 @@ impl CellLock {
             }
         }
     }
-}
-fn dialed(raw: &str) -> bool {
-    parser::ok(raw)
-        && raw
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("+QMAP:"))
-            .any(|line| {
-                let fields = parser::fields(line);
-                fields.len() >= 5
-                    && fields[0].eq_ignore_ascii_case("WWAN")
-                    && matches!(fields[3].as_str(), "IPV4" | "IPV6")
-                    && fields[4].parse::<IpAddr>().is_ok_and(|ip| {
-                        !ip.is_unspecified()
-                            && !ip.is_loopback()
-                            && !ip.is_multicast()
-                            && match ip {
-                                IpAddr::V4(ip) => !ip.is_link_local(),
-                                IpAddr::V6(ip) => !ip.is_unicast_link_local(),
-                            }
-                    })
-            })
 }
 
 #[cfg(test)]

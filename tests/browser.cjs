@@ -11,7 +11,7 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const base = process.env.DEVICE_URL || 'http://127.0.0.1:18082';
   const docs = process.env.CAPTURE_DOCS && !process.env.DEVICE_URL ? path.join(root,'docs/images') : null;
   if (docs) fs.mkdirSync(docs,{recursive:true});
-  const child = process.env.DEVICE_URL ? null : spawn(path.join(root, 'target/debug/simpleadmin-httpd'), ['--mock', '--http', '127.0.0.1:18082', '--static', path.join(root, 'development/simpleadmin/www'), '--auth-file', path.join(temporary, 'auth'), '--ttl-file', path.join(temporary, 'ttl')], {stdio: ['ignore', 'pipe', 'pipe']});
+  const child = process.env.DEVICE_URL ? null : spawn(path.join(root, 'target/debug/simpleadmin-httpd'), ['--mock', '--http', '127.0.0.1:18082', '--static', path.join(root, 'development/simpleadmin/www'), '--auth-file', path.join(temporary, 'auth')], {stdio: ['ignore', 'pipe', 'pipe']});
   let logs = '';
   if (child) {child.stdout.on('data', b => logs += b); child.stderr.on('data', b => logs += b);}
   let browser;
@@ -26,7 +26,7 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       if (docs && language==='zh-CN') await page.screenshot({path:path.join(docs,'login.png')});
       await page.locator('#username').fill('admin'); await page.locator('#password').fill('admin');
       await page.locator('#loginButton').click(); await page.waitForURL(base + '/');
-      await page.waitForFunction(() => document.querySelectorAll('#monitorApp canvas').length === 4);
+      await page.waitForFunction(() => document.querySelectorAll('#monitorApp canvas').length === 3);
       await page.waitForTimeout(1500);
       assert.equal(await page.locator('html').getAttribute('lang'), language);
       assert.equal(await page.locator('html').getAttribute('dir'), language === 'ar' ? 'rtl' : 'ltr');
@@ -38,8 +38,8 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       });
       for (const [endpoint,result] of Object.entries(api)) assert.equal(result.status,200, endpoint);
       assert.equal(api['/api/device_info_data'].data.modelName,process.env.DEVICE_URL ? 'RM520N-EU' : 'RG520N-EB');
-      assert(api['/api/telemetry'].data.ping.length > 0);
       assert(api['/api/telemetry'].data.signal.length > 0);
+      assert(api['/api/telemetry'].data.signal.some(point => point.temperature !== null));
       for (const name of ['deviceinfo','network','sms','settings','index']) {
         const link = page.locator(`.sa-menu-link[data-page-link="${name}"]`);
         if (await link.count()) {await link.click(); await page.waitForTimeout(200);}
@@ -52,20 +52,20 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       await page.waitForTimeout(6000);
       assert.notEqual(await page.locator('.art-update-label b').textContent(), updated, 'overview must repaint after navigation');
       const history = await page.evaluate(async () => (await fetch('/api/telemetry')).json());
-      assert(history.ping.at(-1).time > api['/api/telemetry'].data.ping.at(-1).time);
-      assert(history.ping.length <= 300 && history.signal.length <= 60);
+      assert(history.signal.at(-1).time > api['/api/telemetry'].data.signal.at(-1).time);
+      assert(history.signal.length <= 60);
       assert(history.traffic.length <= 60 && history.traffic.some(p=>p.download!==null));
       if (history.trafficSummary.downloadShare !== null) assert.equal(Math.round((history.trafficSummary.downloadShare+history.trafficSummary.uploadShare)*10),1000);
       for (const width of [1440,1024,390,320]) {
         await page.setViewportSize({width,height:1100});
         await page.waitForTimeout(350);
-        const trafficBox = await page.locator('.art-traffic-section').boundingBox();
-        const pingBox = await page.locator('.art-ping-section').boundingBox();
+        const signalBox = await page.locator('[aria-labelledby="signalChartTitle"]').boundingBox();
+        const temperatureBox = await page.locator('[aria-labelledby="temperatureChartTitle"]').boundingBox();
         if (width >= 992) {
-          assert(Math.abs(trafficBox.y-pingBox.y)<2, 'traffic and ping charts must share a row');
-          assert(Math.abs(trafficBox.width-pingBox.width)<2, 'traffic and ping charts must have equal widths');
+          assert(Math.abs(signalBox.y-temperatureBox.y)<2, 'signal and temperature charts must share a row');
+          assert(Math.abs(signalBox.width-temperatureBox.width)<2, 'signal and temperature charts must have equal widths');
         } else {
-          assert(pingBox.y>=trafficBox.y+trafficBox.height, 'mobile charts must stack');
+          assert(temperatureBox.y>=signalBox.y+signalBox.height, 'mobile charts must stack');
         }
         if (width < 992) {
           const sidebar = await page.locator('.sa-sidebar').boundingBox();

@@ -62,15 +62,15 @@ pub fn run(check_only: bool) -> Result<()> {
     if let Some(password) = &value.root_password {
         auth::change_root(&store, "", password, true)?;
         store.write(
-            Path::new("/usrdata/simpleadmin/root-password.initialized"),
+            Path::new("/etc/simpleadmin/root-password.initialized"),
             b"1\n",
             0o600,
         )?;
     }
     if let (Some(user), Some(password)) = (&value.web_username, &value.web_password) {
         store.write(
-            Path::new("/usrdata/simpleadmin/simpleadmin.auth"),
-            format!("{user}:{password}\n").as_bytes(),
+            Path::new("/etc/simpleadmin/auth"),
+            format!("{user}:{}\n", auth::hash_password(password)?).as_bytes(),
             0o600,
         )?;
     }

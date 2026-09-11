@@ -66,25 +66,6 @@ async fn replacing_with_temporary_or_unlock_removes_boot_rule() {
     assert!(lock.state.lock().unwrap().settings.rules[1].is_none());
 }
 #[test]
-fn dial_detection_rejects_empty_stale_and_link_local_addresses() {
-    for ip in [
-        "0.0.0.0",
-        "127.0.0.1",
-        "169.254.1.2",
-        "::",
-        "::1",
-        "fe80::1",
-        "bad",
-    ] {
-        assert!(!dialed(&format!(
-            "+QMAP: \"WWAN\",1,1,\"IPV6\",\"{ip}\"\nOK"
-        )));
-    }
-    assert!(dialed("+QMAP: \"WWAN\",1,1,\"IPV4\",\"10.1.2.3\"\nOK"));
-    assert!(dialed("+QMAP: \"WWAN\",1,1,\"IPV6\",\"2408::123\"\nOK"));
-    assert!(!dialed("+QMAP: \"WWAN\",1,1,\"IPV4\",\"10.1.2.3\"\nERROR"));
-}
-#[test]
 fn invalid_saved_rule_is_never_executed() {
     let (lock, _at, _dir) = setup();
     std::fs::write(
@@ -105,16 +86,12 @@ fn invalid_saved_rule_is_never_executed() {
 #[tokio::test]
 async fn data_session_keeps_rule_and_cancels_guard_after_settling() {
     let (lock, at, _dir) = setup();
-    at.overrides.lock().unwrap().insert(
-        "AT+QMAP=\"WWAN\"".into(),
-        "+QMAP: \"WWAN\",1,1,\"IPV4\",\"10.1.2.3\"\nOK".into(),
-    );
     lock.apply(&at, &params("persistent")).await.unwrap();
-    lock.check(&at).await;
+    lock.check_with_connected(&at, false).await;
     assert!(lock.state.lock().unwrap().runtime[1].deadline.is_some());
     lock.state.lock().unwrap().runtime[1].deadline =
         Some(Instant::now() + Duration::from_secs(150));
-    lock.check(&at).await;
+    lock.check_with_connected(&at, true).await;
     assert_eq!(lock.snapshot()["radios"][1]["phase"], "connected");
     assert_eq!(lock.snapshot()["radios"][1]["persistent"], true);
     assert!(lock.state.lock().unwrap().runtime[1].deadline.is_none());
@@ -136,15 +113,11 @@ async fn rejected_lock_is_not_saved_and_failed_unlock_retries_even_after_connect
         .lock()
         .unwrap()
         .insert("AT+QNWLOCK=\"common/5g\",0".into(), "ERROR".into());
-    lock.check(&at).await;
+    lock.check_with_connected(&at, false).await;
     assert_eq!(lock.snapshot()["radios"][1]["phase"], "fallback_error");
     assert_eq!(lock.snapshot()["radios"][1]["persistent"], false);
     at.overrides.lock().unwrap().clear();
-    at.overrides.lock().unwrap().insert(
-        "AT+QMAP=\"WWAN\"".into(),
-        "+QMAP: \"WWAN\",1,1,\"IPV4\",\"10.1.2.3\"\nOK".into(),
-    );
-    lock.check(&at).await;
+    lock.check_with_connected(&at, false).await;
     assert_eq!(lock.snapshot()["radios"][1]["phase"], "fallback");
 }
 

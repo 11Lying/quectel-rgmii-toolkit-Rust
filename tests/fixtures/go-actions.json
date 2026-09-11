@@ -105,14 +105,6 @@
   },
   {
     "commands": [
-      "ATI"
-    ],
-    "page": "settings",
-    "query": "action=manual_at\u0026command=ATI",
-    "status": 200
-  },
-  {
-    "commands": [
       "AT+EGMR=1,7,\"123456789012345\";+CFUN=1,1"
     ],
     "page": "settings",
@@ -133,94 +125,6 @@
     ],
     "page": "settings",
     "query": "action=reset_at",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"MPDN_RULE\",0,1,0,1,1,\"FF:FF:FF:FF:FF:FF\""
-    ],
-    "page": "settings",
-    "query": "action=ip_passthrough\u0026mode=ETH\u0026enabled=true",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"MPDN_RULE\",0,1,0,3,1,\"FF:FF:FF:FF:FF:FF\""
-    ],
-    "page": "settings",
-    "query": "action=ip_passthrough\u0026mode=USB\u0026enabled=true",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"DHCPV4DNS\",\"enable\""
-    ],
-    "page": "settings",
-    "query": "action=dns_proxy\u0026family=4\u0026enabled=true",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"DHCPV6DNS\",\"disable\""
-    ],
-    "page": "settings",
-    "query": "action=dns_proxy\u0026family=6\u0026enabled=false",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QCFG=\"usbnet\",1"
-    ],
-    "page": "settings",
-    "query": "action=usbnet\u0026mode=ECM",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QCFG=\"usbnet\",0"
-    ],
-    "page": "settings",
-    "query": "action=usbnet\u0026mode=RMNET",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QCFG=\"usbnet\",2"
-    ],
-    "page": "settings",
-    "query": "action=usbnet\u0026mode=MBIM",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QCFG=\"usbnet\",3"
-    ],
-    "page": "settings",
-    "query": "action=usbnet\u0026mode=RNDIS",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"DMZ\",1,4,192.168.225.10"
-    ],
-    "page": "settings",
-    "query": "action=dmz\u0026enabled=true\u0026ip=192.168.225.10",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"DMZ\",0"
-    ],
-    "page": "settings",
-    "query": "action=dmz\u0026enabled=false",
-    "status": 200
-  },
-  {
-    "commands": [
-      "AT+QMAP=\"LANIP\",192.168.225.2,192.168.225.100,192.168.225.1"
-    ],
-    "page": "settings",
-    "query": "action=lanip\u0026start=192.168.225.2\u0026end=192.168.225.100\u0026gateway=192.168.225.1",
     "status": 200
   }
 ]

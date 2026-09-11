@@ -19,7 +19,7 @@ assert.equal(app.nr_dl_speed,'0 B/s');
 app.updateTraffic({...sample,nr_dl_speed:'-',nr_ul_speed:'-'});
 assert.equal(app.nr_dl_speed,'-');
 vm.runInContext(fs.readFileSync(path.join(root,'development/simpleadmin/www/js/monitor.js'),'utf8'),context);
-const options = window.SimpleAdminMonitor.chartOptions({serverTime:300000,signal:[],ping:[],traffic:[{time:5000,download:null,upload:null},{time:10000,download:2097152,upload:524288}]},'NR',{},true).traffic;
+const options = window.SimpleAdminMonitor.chartOptions({serverTime:300000,signal:[],traffic:[{time:5000,download:null,upload:null},{time:10000,download:2097152,upload:524288}]},'NR',{},true).traffic;
 assert.equal(options.yAxis.name,'MB/s');
 assert.equal(options.series[0].data[0][1],null);
 assert.equal(options.series[0].data[1][1],2);

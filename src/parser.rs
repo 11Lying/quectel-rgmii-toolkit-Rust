@@ -393,6 +393,11 @@ pub fn dashboard(raw: &str) -> Value {
                             && *v != "0.0.0.0"
                             && *v != "0:0:0:0:0:0:0:0"
                             && *v != "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"
+                            && if key == "ipv4" {
+                                v.parse::<std::net::Ipv4Addr>().is_ok()
+                            } else {
+                                v.parse::<std::net::Ipv6Addr>().is_ok()
+                            }
                     }) && text(&d, key) == "-"
                     {
                         d[key] = json!(v);
@@ -400,6 +405,8 @@ pub fn dashboard(raw: &str) -> Value {
                     }
                 }
             }
+            // Retain parsing of historic QMAP output for cached/fixture compatibility.
+            // Active AT command paths do not query QMAP on the USB modem port.
             "+QMAP" if p.len() > 4 && p[0] == "WWAN" && !p[4].is_empty() => {
                 if p[3] == "IPV4" {
                     d["ipv4"] = json!(p[4]);
@@ -519,7 +526,7 @@ pub fn dashboard(raw: &str) -> Value {
     d
 }
 pub fn device(raw: &str) -> Value {
-    let mut d = json!({"manufacturer":"-","modelName":"-","firmwareVersion":"-","simStatus":"未知","simInserted":false,"imsi":"-","iccid":"-","imei":"-","lanIp":"-","wwanIpv4":"-","wwanIpv6":"-","phoneNumber":"-"});
+    let mut d = json!({"manufacturer":"-","modelName":"-","firmwareVersion":"-","simStatus":"未知","simInserted":false,"imsi":"-","iccid":"-","imei":"-","wwanIpv4":"-","wwanIpv6":"-","phoneNumber":"-"});
     let (mut sim, mut absent) = (None, false);
     let mut values = vec![];
     static IMEI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{14,17}").unwrap());
@@ -552,7 +559,8 @@ pub fn device(raw: &str) -> Value {
                 d["iccid"] = json!(tail.trim());
                 sim = Some(true)
             }
-            "+QMAP" if p.len() > 3 && p[0] == "LANIP" => d["lanIp"] = json!(p[3]),
+            // Retain parsing of historic QMAP output for cached/fixture compatibility.
+            // Active AT command paths do not query QMAP on the USB modem port.
             "+QMAP" if p.len() > 4 && p[0] == "WWAN" => {
                 if p[3] == "IPV4" {
                     d["wwanIpv4"] = json!(p[4])
@@ -695,46 +703,11 @@ pub fn network(raw: &str) -> Value {
     out
 }
 pub fn settings(raw: &str) -> Value {
-    let mut out = json!({"ipPassStatus":false,"DNSV6ProxyStatus":false,"DNSV4ProxyStatus":false,"currentUsbNetMode":"未知","dmzMode":"0","dmzIP":"","lanIpStart":"","lanIpEnd":"","lanGwIp":"","imei":"-"});
+    let mut out = json!({"imei":"-"});
     static IMEI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{14,17}").unwrap());
     for line in lines(raw) {
-        let (key, tail) = line.split_once(':').unwrap_or(("", line));
-        let p = fields(tail);
-        if key == "+QMAP" && !p.is_empty() {
-            match p[0].to_ascii_uppercase().as_str() {
-                "MPDN_RULE" if p.len() > 2 && p[2] == "1" => out["ipPassStatus"] = json!(true),
-                "DHCPV6DNS" => {
-                    out["DNSV6ProxyStatus"] =
-                        json!(line.to_ascii_lowercase().contains("\"enable\""))
-                }
-                "DHCPV4DNS" => {
-                    out["DNSV4ProxyStatus"] =
-                        json!(line.to_ascii_lowercase().contains("\"enable\""))
-                }
-                "DMZ" if p.len() > 1 => {
-                    out["dmzMode"] = json!(p[1]);
-                    if p.len() > 3 && p[1] == "1" {
-                        out["dmzIP"] = json!(p[3])
-                    }
-                }
-                "LANIP" if p.len() > 3 => {
-                    for (i, k) in [(1, "lanIpStart"), (2, "lanIpEnd")] {
-                        let a: Vec<_> = p[i].split('.').collect();
-                        out[k] = json!(if a.len() == 4 { a[3] } else { "" })
-                    }
-                    out["lanGwIp"] = json!(p[3])
-                }
-                _ => {}
-            }
-        } else if p.len() > 1 && p[0] == "usbnet" {
-            out["currentUsbNetMode"] = json!(match p[1].as_str() {
-                "0" => "RMNET",
-                "1" => "ECM",
-                "2" => "MBIM",
-                "3" => "RNDIS",
-                _ => "",
-            });
-        } else if (key.eq_ignore_ascii_case("+CGSN") || (plain(line) && text(&out, "imei") == "-"))
+        let (key, _) = line.split_once(':').unwrap_or(("", line));
+        if (key.eq_ignore_ascii_case("+CGSN") || (plain(line) && text(&out, "imei") == "-"))
             && let Some(v) = IMEI.find(line)
         {
             out["imei"] = json!(v.as_str())

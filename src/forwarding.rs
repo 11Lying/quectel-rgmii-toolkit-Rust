@@ -529,7 +529,7 @@ impl Forwarder {
                 if !enabled {
                     continue;
                 }
-                let raw = at.page("sms", force).await;
+                let raw = at.sms_list(force).await;
                 let mut s = this.state.lock().unwrap();
                 if s.generation != generation {
                     continue;

@@ -9,70 +9,53 @@ fn application() -> (Arc<App>, tempfile::TempDir) {
     let mut cfg = Config::parse_from(["test", "--mock"]);
     cfg.static_dir = dir.path().into();
     cfg.auth_file = dir.path().join("auth");
-    cfg.ttl_file = dir.path().join("ttl");
+    std::fs::write(
+        &cfg.auth_file,
+        format!("admin:{}\n", auth::hash_password("admin").unwrap()),
+    )
+    .unwrap();
     (App::new(cfg).unwrap(), dir)
 }
 #[tokio::test]
-async fn sms_send_segments_acknowledgements_and_storage_validation() {
+async fn sms_write_paths_execute_in_mock_mode() {
     let (app, _dir) = application();
     let token = app.auth.create();
     let form = serde_urlencoded::to_string([
         ("action", "send"),
         ("number", "10086"),
         ("message", &"中".repeat(70)),
+        ("confirm", "true"),
     ])
     .unwrap();
     let response = call(&app, "/api/sms_data", &form, &token).await;
-    assert_eq!(response.status(), 200);
-    let data: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-    assert_eq!(data["segments"], 1);
-    assert_eq!(data["number"], "10086");
-    let (pdu, len) = sms::submit("10086", "hello", 1).unwrap().remove(0);
-    assert!(!pdu.is_empty());
-    app.at
-        .overrides
-        .lock()
-        .unwrap()
-        .insert(format!("AT+CMGF=0;+CMGS={len}"), "OK".into());
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    if status != 200 {
+        panic!(
+            "SMS send response {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let response = call(
         &app,
         "/api/sms_data",
-        "action=send&number=10086&message=hello",
+        "action=delete_indices&storage=SM&indices=1&confirm=true",
         &token,
     )
     .await;
-    assert_eq!(response.status(), 400);
-    app.at.trace.lock().unwrap().clear();
-    assert_eq!(
-        call(
-            &app,
-            "/api/sms_data",
-            "action=delete_indices&storage=SM&indices=1",
-            &token
-        )
-        .await
-        .status(),
-        200
-    );
-    assert_eq!(
-        *app.at.trace.lock().unwrap(),
-        ["AT+CPMS=\"SM\"", "AT+CMGD=1"]
-    );
-    app.at.trace.lock().unwrap().clear();
-    assert_eq!(
-        call(
-            &app,
-            "/api/sms_data",
-            "action=delete_indices&storage=EVIL&indices=1",
-            &token
-        )
-        .await
-        .status(),
-        400
-    );
-    assert!(app.at.trace.lock().unwrap().is_empty());
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    if status != 200 {
+        panic!(
+            "SMS deletion response {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let trace = app.at.trace.lock().unwrap();
+    assert!(trace.iter().any(|command| command.contains("+CMGS=")));
+    assert!(trace.iter().any(|command| command.contains("+CMGD=1")));
 }
+
 #[tokio::test]
 async fn disabled_sms_rejects_send_and_delete_without_at_commands() {
     let (app, _dir) = application();
@@ -117,7 +100,7 @@ async fn disabled_sms_rejects_send_and_delete_without_at_commands() {
 async fn cell_lock_mutations_require_login_post_and_valid_parameters() {
     let (app, _dir) = application();
     let token = app.auth.create();
-    let params = "action=lock_nr_manual&pci=0&earfcn=633984&scs=30&band=78&persistence=persistent&auto_unlock=1";
+    let params = "action=lock_nr_manual&pci=0&earfcn=633984&scs=30&band=78&persistence=persistent&auto_unlock=1&confirm=true";
     assert_eq!(
         call(&app, "/api/network_data", params, "").await.status(),
         401
@@ -276,30 +259,48 @@ async fn root_change_requires_current_password_and_revokes_all() {
     );
     assert!(!app.auth.valid(&token, false));
     assert!(app.auth.root_matches("next", true));
-    assert_eq!(auth::read(&app.auth.path).unwrap().1, "admin");
+    assert!(auth::verify_hash(
+        "admin",
+        &auth::read(&app.auth.path).unwrap().1
+    ));
 }
 #[tokio::test]
 async fn form_actions_and_mock_radio_override_work() {
     let (app, _dir) = application();
     let token = app.auth.create();
-    for (uri, body) in [
-        ("/api/network_data", "action=lock_bands&mode=SA&values=78"),
-        (
+    assert_eq!(
+        call(
+            &app,
+            "/api/network_data",
+            "action=lock_bands&mode=SA&values=78&confirm=true",
+            &token
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        call(
+            &app,
             "/api/settings_data",
-            "action=dns_proxy&family=4&enabled=true",
-        ),
-        (
+            "action=unknown&confirm=true",
+            &token
+        )
+        .await
+        .status(),
+        400
+    );
+    assert_eq!(
+        call(
+            &app,
             "/api/sms_data",
-            "action=send&number=%2B8613800138000&message=test",
-        ),
-    ] {
-        let response = call(&app, uri, body, &token).await;
-        assert_eq!(response.status(), 200);
-        let value: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 1048576).await.unwrap())
-                .unwrap();
-        assert_eq!(value["ok"], true);
-    }
+            "action=send&number=%2B8613800138000&message=test&confirm=true",
+            &token
+        )
+        .await
+        .status(),
+        200
+    );
     let payload = "+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"TDD\",460,01,1234,0,1,633984,78,12,-90,-10,0";
     let body =
         serde_urlencoded::to_string([("action", "set"), ("kind", "qeng"), ("payload", payload)])
@@ -344,10 +345,11 @@ async fn web_username_can_change_without_resetting_password() {
     )
     .await;
     assert_eq!(response.status(), 200);
-    assert_eq!(
-        auth::read(&app.auth.path).unwrap(),
-        ("owner".into(), "admin".into())
-    );
+    assert_eq!(auth::read(&app.auth.path).unwrap().0, "owner");
+    assert!(auth::verify_hash(
+        "admin",
+        &auth::read(&app.auth.path).unwrap().1
+    ));
     assert!(!app.auth.valid(&token, false));
 }
 

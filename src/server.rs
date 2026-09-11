@@ -6,8 +6,7 @@ use crate::{
     forwarding::{Forwarder, Settings as ForwardingSettings},
     parser,
     persistence::Store,
-    sms,
-    system::{self, Metrics},
+    sms, system,
     telemetry::Monitor,
 };
 use anyhow::{Result, bail};
@@ -39,10 +38,7 @@ pub struct App {
     pub store: Arc<Store>,
     pub monitor: Arc<Monitor>,
     pub forwarding: Arc<Forwarder>,
-    metrics: Metrics,
     pub sockets: Arc<tokio::sync::Semaphore>,
-    pub consoles: Arc<tokio::sync::Semaphore>,
-    ttl_lock: tokio::sync::Mutex<()>,
     pub webui: crate::webui::ListenerState,
     pub cell_lock: Arc<crate::cell_lock::CellLock>,
 }
@@ -110,11 +106,7 @@ impl App {
         let store = Arc::new(Store::new(config.mock));
         let auth = Auth::new(config.auth_file.clone(), &store)?;
         let at = At::start(config.mock, config.devices())?;
-        let monitor = Monitor::new(
-            config.auth_file.with_file_name("monitor.json"),
-            config.mock,
-            store.clone(),
-        );
+        let monitor = Monitor::new(config.mock);
         let forwarding = Arc::new(Forwarder::new(
             config.auth_file.with_file_name("forwarding.json"),
             store.clone(),
@@ -130,10 +122,7 @@ impl App {
             store,
             monitor,
             forwarding,
-            metrics: Metrics::default(),
             sockets: Arc::new(tokio::sync::Semaphore::new(8)),
-            consoles: Arc::new(tokio::sync::Semaphore::new(2)),
-            ttl_lock: tokio::sync::Mutex::new(()),
             webui: crate::webui::ListenerState::default(),
             cell_lock,
         }))
@@ -155,14 +144,14 @@ impl App {
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/api/ws", get(websocket))
-            .route("/api/console/ws", get(console_socket))
+            .route("/api/console/ws", get(crate::console::websocket))
             .route(
                 "/console",
-                get(|| async { axum::response::Html(include_str!("console.html")) }),
+                get(|| async { axum::response::Html(crate::console::page()) }),
             )
             .route(
                 "/console/",
-                get(|| async { axum::response::Html(include_str!("console.html")) }),
+                get(|| async { axum::response::Html(crate::console::page()) }),
             )
             .fallback(dispatch)
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
@@ -228,6 +217,12 @@ async fn dispatch(State(app): State<Arc<App>>, request: Request) -> Response {
         if method != "GET" && method != "HEAD" {
             return error(405, "method not allowed");
         }
+        let uri = match path.parse::<axum::http::Uri>() {
+            Ok(uri) => uri,
+            Err(_) => return error(400, "invalid static path"),
+        };
+        let mut request = request;
+        *request.uri_mut() = uri;
         use tower::ServiceExt;
         return match ServeDir::new(&app.config.static_dir).oneshot(request).await {
             Ok(response) => response.map(Body::new),
@@ -277,7 +272,6 @@ pub async fn api(
         "/api/set_webui_port",
         "/api/set_password",
         "/api/set_root_password",
-        "/api/telemetry/target",
         "/api/forwarding/save",
         "/api/forwarding/test",
         "/api/sms/settings",
@@ -287,7 +281,25 @@ pub async fn api(
     {
         return error(405, "method not allowed");
     }
-    if path == "/api/telemetry" && method != "GET" {
+    if [
+        "/api/modem/discovery",
+        "/api/network_status",
+        "/api/module_model",
+        "/api/dashboard_data",
+        "/api/device_info_data",
+        "/api/network_data",
+        "/api/settings_data",
+        "/api/sms_data",
+        "/api/forwarding",
+        "/api/get_sms",
+        "/api/get_uptime",
+        "/api/get_language",
+        "/api/webui_settings",
+    ]
+    .contains(&path)
+        && method != "GET"
+        && method != "POST"
+    {
         return error(405, "method not allowed");
     }
     if ["/api/login", "/api/set_password", "/api/set_root_password"].contains(&path)
@@ -309,7 +321,7 @@ pub async fn api(
             Err(_) => return error(500, "auth config error"),
         };
         if !auth::equal(p.get("username"), &credentials.0)
-            || !auth::equal(p.get("password"), &credentials.1)
+            || !auth::verify_hash(p.get("password"), &credentials.1)
         {
             return error(401, "invalid credentials");
         }
@@ -335,11 +347,16 @@ pub async fn api(
     }
     let force = p.flag("force", false);
     let action = p.get("action");
-    if path == "/api/network_data"
-        && crate::cell_lock::CellLock::handles(action)
-        && method != "POST"
-    {
+    if method != "POST" && mutation_route(path, action) {
         return error(405, "method not allowed");
+    }
+    if path == "/api/network_data" && crate::cell_lock::CellLock::handles(action) {
+        if method != "POST" {
+            return error(405, "method not allowed");
+        }
+        if let Err(e) = mutation_confirmation(&p, true) {
+            return error(400, e);
+        }
     }
     let result:Result<Response>=async {
         let value=match path {
@@ -358,51 +375,96 @@ pub async fn api(
                 if body.len()>128{bail!("test request too large")}
                 let test:Test=serde_json::from_str(body)?;app.forwarding.test(&test.platform).await?
             },
-            "/api/telemetry"=>{
+            "/api/get_atcache" | "/api/get_atcommand" | "/api/user_atcommand" => {
+                let command = p.get("atcmd");
+                if command.is_empty() {
+                    return Ok(text_response(String::new()));
+                }
+                crate::at_policy::validate(command)?;
+                let class = crate::at_policy::classify(command)
+                    .unwrap_or(crate::at_policy::CommandClass::SensitiveWrite);
+                mutation_confirmation(
+                    &p,
+                    !matches!(class, crate::at_policy::CommandClass::ReadOnly),
+                )?;
+                let _guard = app.forwarding.sms_mutation.lock().await;
+                let response = app
+                    .at
+                    .fetch_wait(command, force, p.flag("wait", true))
+                    .await?;
+                audit_command(app, command, "executed");
+                return Ok(text_response(response));
+            },
+            "/api/telemetry" => {
                 let cursor = p.get("cursor");
                 if cursor.len() > 512 { bail!("invalid telemetry cursor"); }
                 let cursor = serde_json::from_str::<crate::telemetry::Cursor>(cursor).ok();
                 app.monitor.snapshot_since(cursor.as_ref())
             },
-            "/api/telemetry/target"=>{
-                #[derive(Deserialize)]#[serde(deny_unknown_fields)]struct Target{target:String}
-                if body.len()>1024{bail!("target request too large")}let config:Target=serde_json::from_str(body)?;app.monitor.set_target(&config.target).await?;app.monitor.snapshot()
+            "/api/modem/discovery" => json!({
+                "candidates": crate::usb_discovery::discover(),
+            }),
+            "/api/network_status" => serde_json::to_value(crate::network_status::snapshot())?,
+            "/api/module_model" => {
+                let raw = app.at.page("model", force).await?;
+                json!({"model": parser::model(&raw), "pending": raw.contains(crate::at_policy::PENDING)})
             },
-            "/api/module_model"=>{let raw=app.at.page("model",force).await?;json!({"model":parser::model(&raw),"pending":raw.contains(crate::at_policy::PENDING)})},
-            "/api/dashboard_data"=>{
-                let raw=app.at.page("dashboard",force).await?;let mut data=parser::dashboard(&raw);if p.flag("debug",false){data["raw"]=json!(raw)}
-                data["internetConnection"]=json!(if app.monitor.connected(){"已连接"}else{"未连接"});data["uptimeParts"]=system::uptime(app.config.mock).0;
-                data.as_object_mut().unwrap().extend(app.metrics.read(app.config.mock).as_object().unwrap().clone());data.as_object_mut().unwrap().extend(app.monitor.traffic_rates().as_object().unwrap().clone());data["lastUpdate"]=json!(chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string());data
+            "/api/dashboard_data" => {
+                let raw = app.at.page("dashboard", force).await?;
+                let mut data = parser::dashboard(&raw);
+                if p.flag("debug", false) { data["raw"] = json!(raw); }
+                data["internetConnection"] = json!("未知");
+                data["uptimeParts"] = system::uptime(app.config.mock).0;
+                data.as_object_mut().unwrap().extend(app.monitor.traffic_rates().as_object().unwrap().clone());
+                data["lastUpdate"] = json!(chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string());
+                data
             },
-"/api/device_info_data"=>match action{""|"get"=>{let raw=app.at.page("device",force).await?;let mut data=parser::device(&raw);data["appVersion"]=json!(concat!("SimpleAdmin Rust v", env!("CARGO_PKG_VERSION")));let model=app.at.page("model",force).await?;let name=parser::model(&model);if name!="-"{data["modelName"]=json!(name)}data["pending"]=json!(raw.contains(crate::at_policy::PENDING)||model.contains(crate::at_policy::PENDING));data},"set_imei"=>run_action(app,&actions::imei(&p)?).await?,_=>bail!("unsupported action")},
+            "/api/device_info_data" => match action {
+                "" | "get" => {
+                    let raw = app.at.page("device", force).await?;
+                    let mut data = parser::device(&raw);
+                    data["appVersion"] = json!(concat!("SimpleAdmin Rust v", env!("CARGO_PKG_VERSION")));
+                    let model = app.at.page("model", force).await?;
+                    let name = parser::model(&model);
+                    if name != "-" { data["modelName"] = json!(name); }
+                    data["pending"] = json!(raw.contains(crate::at_policy::PENDING) || model.contains(crate::at_policy::PENDING));
+                    data
+                },
+                "set_imei" => {
+                    if let Err(e) = mutation_confirmation(&p, true) { bail!("{e}") }
+                    run_action(app, &actions::imei(&p)?).await?
+                },
+                _ => bail!("unsupported action"),
+            },
             "/api/network_data"=>match action {
                 ""|"settings"=>{let mut data=parser::network(&app.at.page("network",force).await?);data["cell_lock"]=app.cell_lock.snapshot();data},
-                "cell_lock_status"=>app.cell_lock.snapshot(),
-                "model"=>{let raw=app.at.page("model",force).await?;json!({"model":parser::model(&raw),"pending":raw.contains(crate::at_policy::PENDING)})},
-                "bands"=>{let command=if p.get("mode").is_empty(){crate::at::commands("bands")[0].to_owned()}else{format!("AT+QNWPREFCFG=\"{}\"",actions::band_mode(p.get("mode"))?)};let raw=app.at.fetch_wait(&command,force,p.flag("wait",true)).await?;let mut v=parser::bands(&raw);if raw.contains(crate::at_policy::PENDING){v["pending"]=json!(true)}else if raw.to_ascii_lowercase().contains("error"){v["error"]=json!(raw)}v},
-                "scan"=>parser::scan(&app.at.run(actions::scan_mode(p.get("mode"))?).await?),
+                "bands"=>{let command=if p.get("mode").is_empty(){crate::at::commands("bands").first().ok_or_else(|| anyhow::anyhow!("band query unavailable"))?.to_string()}else{format!("AT+QNWPREFCFG=\"{}\"",actions::band_mode(p.get("mode"))?)};let raw=app.at.fetch_wait(&command,force,p.flag("wait",true)).await?;let mut v=parser::bands(&raw);if raw.contains(crate::at_policy::PENDING){v["pending"]=json!(true)}else if raw.to_ascii_lowercase().contains("error"){v["error"]=json!(raw)}v},
+                "scan"=>{mutation_confirmation(&p,true)?;let command=actions::scan_mode(p.get("mode"))?;let result=run_action(app,&command).await?;if !result["ok"].as_bool().unwrap_or(false){bail!("cell scan rejected: {}",parser::text(&result,"response"))}parser::scan(&parser::text(&result,"response"))},
                 action if crate::cell_lock::CellLock::handles(action)=>{let lock=app.cell_lock.clone();let at=app.at.clone();let params=Params(p.0.clone());tokio::spawn(async move{lock.apply(&at,&params).await}).await??},
-                _=>run_action(app,&actions::network(&p)?).await?
+                _=>{mutation_confirmation(&p, true)?;run_action(app,&actions::network(&p)?).await?}
             },
             "/api/settings_data"=>if action.is_empty()||action=="status"{parser::settings(&app.at.page("settings",force).await?)}else{
-                let commands=actions::settings(&p)?;if commands.len()>1{let app=app.clone();tokio::spawn(async move{for command in commands{tokio::time::sleep(Duration::from_secs(1)).await;if run_action(&app,&command).await.ok().is_none_or(|v|v["ok"]!=true){break}}});json!({"ok":true,"response":"设备即将重启","reboot":true,"rebooting":true,"rebootAfterSeconds":1,"rebootCountdownSeconds":40,"message":"设备即将重启，请等待前端倒计时。"})}else{run_action(app,&commands[0]).await?}
+                let commands=actions::settings(&p)?;
+                mutation_confirmation(&p, commands.iter().any(|c| matches!(crate::at_policy::classify(c), Some(crate::at_policy::CommandClass::SensitiveWrite | crate::at_policy::CommandClass::Dangerous))))?;
+                if commands.len()>1{let app=app.clone();tokio::spawn(async move{for command in commands{if run_action(&app,&command).await.ok().is_none_or(|v|v["ok"]!=true){break}}});json!({"ok":true,"response":"设备即将重启","reboot":true,"rebooting":true,"rebootAfterSeconds":1,"rebootCountdownSeconds":40,"message":"设备即将重启，请等待前端倒计时。"})}else{run_action(app,&commands[0]).await?}
             },
             "/api/sms_data"=>if !app.forwarding.sms_enabled(){
                 if matches!(action,""|"list"|"list_meta"){json!({"messages":[],"serviceCenters":[],"disabled":true})}else{bail!("SMS service disabled")}
             }else{match action {
-                ""|"list"|"list_meta"=>{let mut data=sms::list(&app.at.page("sms",force).await?);if action=="list_meta"{for value in data["messages"].as_array_mut().unwrap(){value.as_object_mut().unwrap().remove("text");value.as_object_mut().unwrap().remove("textLines");}}data},
-                "delete_all"=>{let _guard=app.forwarding.sms_mutation.lock().await;let raw=app.at.page("sms",true).await?;if !parser::ok(&raw){bail!("SMS read failed")};let data=sms::list(&raw);let entries=data["messages"].as_array().unwrap();for storage in [sms::Storage::ME,sms::Storage::SM]{if entries.iter().any(|v|sms::Storage::of(v)==storage){app.at.delete_sms(storage,&[],true).await?;}}json!({"ok":true})},
-                "delete_indices"=>{let _guard=app.forwarding.sms_mutation.lock().await;let values=p.list("indices",',');if values.is_empty()||values.len()>1024{bail!("missing indices or too many messages")}let indices=values.iter().map(|v|v.parse::<u16>()).collect::<std::result::Result<Vec<_>,_>>()?;let storage=sms::Storage::parse(p.get("storage"))?;let raw=app.at.delete_sms(storage,&indices,false).await?;json!({"ok":parser::ok(&raw),"response":raw})},
+                ""|"list"|"list_meta"=>{let mut data=sms::list(&app.at.sms_list(force).await?);if action=="list_meta"{for value in data["messages"].as_array_mut().unwrap(){value.as_object_mut().unwrap().remove("text");value.as_object_mut().unwrap().remove("textLines");}}data},
+                "delete_all"=>{
+                    mutation_confirmation(&p,true)?;let _guard=app.forwarding.sms_mutation.lock().await;let raw=app.at.sms_list(true).await?;if !parser::ok(&raw){bail!("SMS read failed")};let data=sms::list(&raw);let entries=data["messages"].as_array().unwrap();for storage in [sms::Storage::ME,sms::Storage::SM]{if entries.iter().any(|v|sms::Storage::of(v)==storage){app.at.delete_sms(storage, &[], true).await?;}}json!({"ok":true})
+                },
+                "delete_indices"=>{
+                    mutation_confirmation(&p,true)?;let _guard=app.forwarding.sms_mutation.lock().await;let values=p.list("indices",',');if values.is_empty()||values.len()>1024{bail!("missing indices or too many messages")}let indices=values.iter().map(|v|v.parse::<u16>()).collect::<std::result::Result<Vec<_>,_>>()?;let storage=sms::Storage::parse(p.get("storage"))?;let raw=app.at.delete_sms(storage,&indices,false).await?;json!({"ok":parser::ok(&raw),"response":raw})
+                },
                 "sim_status"=>{let raw=app.at.run("AT+CPIN?").await?.to_ascii_uppercase();json!({"inserted":!raw.contains("SIM NOT INSERTED")&&!raw.contains("+CME ERROR: 10")})},
-                "send"=>send_sms(app,p.get("number"),p.get("message")).await?,_=>bail!("unsupported action")
+                "sim_switch"=>{mutation_confirmation(&p,true)?;switch_sim(app,&actions::sim_switch(&p)?).await?},
+                "send"=>{mutation_confirmation(&p,true)?;send_sms(app,p.get("number"),p.get("message")).await?},_=>bail!("unsupported action")
             }},
-            "/api/get_atcache"|"/api/get_atcommand"|"/api/user_atcommand"=>{let _guard=app.forwarding.sms_mutation.lock().await;return Ok(text_response(if p.get("atcmd").is_empty(){String::new()}else{app.at.fetch_wait(p.get("atcmd"),force,p.flag("wait",true)).await?}))},
-            "/api/get_ping"=>return Ok(text_response(if app.monitor.connected(){"OK"}else{"ERROR"})),
-            "/api/get_sms"=>{if !app.forwarding.sms_enabled(){bail!("SMS service disabled")}return Ok(text_response(app.at.page("sms",force).await?))},
-            "/api/send_sms"=>{let v=send_sms(app,p.get("number"),p.get("msg")).await?;return Ok(text_response(format!("OK segments={} number={}",v["segments"],parser::text(&v,"number"))))},
+            "/api/send_sms"=>{mutation_confirmation(&p,true)?;let v=send_sms(app,p.get("number"),p.get("msg")).await?;return Ok(text_response(format!("OK segments={} number={}",v["segments"],parser::text(&v,"number"))))},
+            "/api/get_sms"=>{if !app.forwarding.sms_enabled(){bail!("SMS service disabled")}return Ok(text_response(app.at.sms_list(force).await?))},
             "/api/get_uptime"=>return Ok(text_response(system::uptime(app.config.mock).1)),
-            "/api/get_ttl_status"=>{let ttl=system::ttl(&app.config.ttl_file);json!({"isEnabled":ttl>0,"ttl":ttl})},
-            "/api/set_ttl"=>{let _guard=app.ttl_lock.lock().await;let ttl=p.integer("ttlvalue",0,255)?as u8;json!({"debug_logs":system::set_ttl(ttl,app.config.mock,&app.config.ttl_file,app.store.clone()).await?})},
             "/api/get_language"=>{std::fs::read(app.config.static_dir.join("config/get_language.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok()).unwrap_or(json!({"language":"zh-CN"}))},
             "/api/set_language"=>{
                 let data:Value=serde_json::from_str(body).unwrap_or(Value::Null);let language=if p.get("language").is_empty(){parser::text(&data,"language")}else{p.get("language")};let language=match language.to_ascii_lowercase().as_str(){"zh"|"zh-cn"|"cn"|"chinese"=>"zh-CN","en"|"en-us"|"english"=>"en","ru"|"ru-ru"|"russian"=>"ru","ar"|"ar-sa"|"arabic"=>"ar",_=>bail!("unsupported language")};
@@ -410,28 +472,110 @@ pub async fn api(
             },
             "/api/mock_at"=>{
                 if !app.config.mock{return Ok(error(403,"mock mode only"))}
-                crate::mock::handle(&app.at,&p).await?
+                crate::mock::handle(&app.at, &p).await?
             },_=>return Ok(error(404,"unsupported API endpoint"))
         };Ok(json_response(200,value))
     }.await;
+    let status = result.as_ref().err().map_or(400, |e| {
+        if e.to_string().contains("forbidden") || e.to_string().contains("not allowed") {
+            403
+        } else {
+            400
+        }
+    });
     match result {
         Ok(response) => response,
-        Err(e) => error(400, e),
+        Err(e) => error(status, e),
     }
 }
+fn mutation_route(path: &str, action: &str) -> bool {
+    matches!(
+        (path, action),
+        ("/api/device_info_data", "set_imei")
+            | (
+                "/api/network_data",
+                "lock_bands"
+                    | "reset_bands"
+                    | "unlock_lte"
+                    | "unlock_nr"
+                    | "lock_nr_manual"
+                    | "lock_lte_manual"
+                    | "lock_scanned_cells"
+                    | "save_settings"
+                    | "scan"
+            )
+            | ("/api/settings_data", "set_imei" | "reboot" | "reset_at")
+            | (
+                "/api/sms_data",
+                "send" | "delete_all" | "delete_indices" | "sim_switch"
+            )
+            | ("/api/send_sms", _)
+            | ("/api/set_language", _)
+            | ("/api/mock_at", _)
+    )
+}
+
+fn mutation_confirmation(p: &Params, required: bool) -> Result<()> {
+    if required && !p.flag("confirm", false) && p.get("confirmation") != "CONFIRM" {
+        bail!("explicit confirmation required")
+    }
+    Ok(())
+}
+
+pub fn audit_command(app: &App, command: &str, outcome: &str) {
+    let command = command.replace(['\r', '\n'], " ");
+    let path = app.auth.path.with_file_name("audit.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    let _ = std::io::Write::write_fmt(
+        &mut file,
+        format_args!("command outcome={outcome} command={command}\n"),
+    );
+}
+
+async fn switch_sim(app: &Arc<App>, command: &str) -> Result<Value> {
+    crate::at_policy::validate(command)?;
+    let response = app.at.run(command).await?;
+    app.at.invalidate().await;
+    let ok = parser::ok(&response);
+    audit_command(app, command, if ok { "executed" } else { "modem-error" });
+    Ok(json!({"ok": ok, "response": response, "refresh": "sim_status"}))
+}
+
 async fn run_action(app: &Arc<App>, command: &str) -> Result<Value> {
+    crate::at_policy::validate(command)?;
     let _sms_guard = if command.to_ascii_uppercase().contains("+CMGD") {
         Some(app.forwarding.sms_mutation.lock().await)
     } else {
         None
     };
     if _sms_guard.is_some() && !app.forwarding.sms_enabled() {
+        audit_command(app, command, "rejected-sms-disabled");
         bail!("SMS service disabled")
     }
-    let response = app.at.run(command).await?;
+    let response = match app.at.run(command).await {
+        Ok(response) => response,
+        Err(error) => {
+            audit_command(app, command, "error");
+            return Err(error);
+        }
+    };
     app.at.invalidate().await;
-    Ok(json!({"ok":parser::ok(&response),"response":response}))
+    let ok = parser::ok(&response);
+    audit_command(app, command, if ok { "executed" } else { "modem-error" });
+    Ok(json!({"ok":ok,"response":response}))
 }
+
 async fn send_sms(app: &Arc<App>, number: &str, message: &str) -> Result<Value> {
     let _guard = app.forwarding.sms_mutation.lock().await;
     if !app.forwarding.sms_enabled() {
@@ -443,11 +587,9 @@ async fn send_sms(app: &Arc<App>, number: &str, message: &str) -> Result<Value> 
     let number = sms::normalize_number(number, &app.at.fetch("AT+CIMI", false).await?)?;
     let parts = sms::submit(&number, message, rand::random::<u8>())?;
     for (i, (pdu, len)) in parts.iter().enumerate() {
-        let raw = app
-            .at
-            .transaction(&format!("AT+CMGF=0;+CMGS={len}"), Some(pdu.clone()))
-            .await?;
+        let raw = app.at.sms_send(pdu.clone(), *len).await?;
         if !sms::sent(&raw) {
+            audit_command(app, "SMS", "modem-error");
             bail!("SMS segment {} failed: {}", i + 1, raw)
         }
         if i + 1 < parts.len() {
@@ -455,8 +597,10 @@ async fn send_sms(app: &Arc<App>, number: &str, message: &str) -> Result<Value> 
         }
     }
     app.at.invalidate().await;
+    audit_command(app, "SMS", "executed");
     Ok(json!({"ok":true,"segments":parts.len(),"number":number}))
 }
+
 async fn change_password(app: &Arc<App>, p: &Params, root: bool) -> Response {
     let _guard = app.auth.mutation.lock().await;
     let get = |a, b| {
@@ -488,6 +632,14 @@ async fn change_password(app: &Arc<App>, p: &Params, root: bool) -> Response {
     if (root || !confirm.is_empty()) && next != confirm {
         return error(400, "password confirmation mismatch");
     }
+    let password_hash = if root {
+        None
+    } else {
+        match auth::hash_password(next) {
+            Ok(hash) => Some(hash),
+            Err(hash_error) => return error(500, hash_error),
+        }
+    };
     let result = if root {
         let app2 = app.clone();
         let current = current.to_owned();
@@ -513,7 +665,7 @@ async fn change_password(app: &Arc<App>, p: &Params, root: bool) -> Response {
             Ok(c) => c,
             Err(e) => return error(500, e),
         };
-        if !auth::equal(current, &password) {
+        if !auth::verify_hash(current, &password) {
             return error(403, "current password incorrect");
         }
         let path = app.auth.path.clone();
@@ -523,7 +675,7 @@ async fn change_password(app: &Arc<App>, p: &Params, root: bool) -> Response {
         } else {
             username.into()
         };
-        let data = format!("{user}:{next}\n");
+        let data = format!("{user}:{}\n", password_hash.expect("web password hash"));
         match tokio::task::spawn_blocking(move || store.write(&path, data.as_bytes(), 0o600)).await
         {
             Ok(r) => r.map_err(Into::into),
@@ -576,28 +728,6 @@ async fn websocket(
         })
         .into_response()
 }
-async fn console_socket(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    if !origin_allowed(&headers, !app.config.no_tls) {
-        return error(403, "websocket origin forbidden");
-    }
-    let token = cookie(&headers);
-    let permit = match app.consoles.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return error(503, "too many connections"),
-    };
-    upgrade
-        .max_message_size(16 * 1024)
-        .max_frame_size(16 * 1024)
-        .on_upgrade(move |socket| async move {
-            let _permit = permit;
-            crate::console::run(app, socket, token).await
-        })
-        .into_response()
-}
 #[derive(Deserialize)]
 struct WsRequest {
     #[serde(default)]
@@ -623,7 +753,7 @@ async fn ws_loop(app: Arc<App>, mut socket: WebSocket, token: String) {
                 let request=match serde_json::from_slice::<WsRequest>(&payload){Ok(r)=>r,Err(_)=>{let _=socket.send(Message::Text(json!({"id":"","status":400,"body":"","error":"invalid JSON request"}).to_string().into())).await;continue}};
                 let method=if request.method.is_empty(){"GET".into()}else{request.method.to_ascii_uppercase()};
                 let uri=request.path.parse::<axum::http::Uri>();let mut response=match uri {
-                    Ok(uri) if uri.scheme().is_none()&&uri.authority().is_none()&&uri.path().starts_with("/api/")&&!matches!(uri.path(),"/api/ws"|"/api/console/ws"|"/api/login"|"/api/logout")=>api(&app,&method,uri.path(),uri.query().unwrap_or(""),&request.body,&token).await,
+                    Ok(uri) if uri.scheme().is_none()&&uri.authority().is_none()&&uri.path().starts_with("/api/")&&!matches!(uri.path(),"/api/ws"|"/api/login"|"/api/logout")=>api(&app,&method,uri.path(),uri.query().unwrap_or(""),&request.body,&token).await,
                     _=>error(404,"unsupported websocket API endpoint")
                 };
                 let status=response.status().as_u16();let mut headers=serde_json::Map::new();for(name,value)in response.headers(){headers.insert(name.to_string(),json!([value.to_str().unwrap_or("")]));}

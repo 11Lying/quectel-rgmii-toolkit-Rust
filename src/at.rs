@@ -1,7 +1,8 @@
-use crate::at_policy as policy;
+use crate::{
+    at_policy as policy,
+    at_transport::{AtTransport, MockAtTransport, UsbAtTransport},
+};
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
-use std::io::{Read, Write};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -9,7 +10,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-pub const DASHBOARD: &str = "AT+QSIMSTAT?;+CSQ;+QTEMP;+QUIMSLOT?;+QSPN;+QMAP=\"WWAN\";+QENG=\"servingcell\";+QCAINFO;+QGDNRCNT?;+QGDCNT?;+CGCONTRDP=1;+QRSRP";
+pub const DASHBOARD: &str = "AT+QSIMSTAT?;+CSQ;+QTEMP;+QUIMSLOT?;+QSPN;+QENG=\"servingcell\";+QCAINFO;+QGDNRCNT?;+QGDCNT?;+CGCONTRDP=1;+QRSRP";
 pub const SIGNAL: &str = "AT+QTEMP;+QENG=\"servingcell\"";
 pub const SMS_LIST: &str = "AT+CMGF=0;+CNMI=2,1,0,0,0;+CMGL=4";
 pub fn commands(page: &str) -> Vec<&'static str> {
@@ -17,21 +18,16 @@ pub fn commands(page: &str) -> Vec<&'static str> {
         "dashboard" => vec![DASHBOARD],
         "device" => vec![
             "AT+CGMI;+CGSN;+QGMR;+CIMI;+ICCID;+CNUM",
-            "AT+QSIMSTAT?;+CPIN?;+QMAP=\"WWAN\"",
-            "AT+QMAP=\"LANIP\"",
+            "AT+QSIMSTAT?;+CPIN?;+QUIMSLOT?",
         ],
         "network" => vec![
             "AT+QUIMSLOT?;+QNWPREFCFG=\"mode_pref\";+QNWPREFCFG=\"nr5g_disable_mode\";+CGDCONT?;+CGCONTRDP=1;+QNWLOCK=\"common/4g\";+QNWLOCK=\"common/5g\"",
             "AT+QCAINFO",
         ],
         "bands" => vec![
-            "AT+QNWPREFCFG=\"lte_band\";+QNWPREFCFG= \"nsa_nr5g_band\";+QNWPREFCFG= \"nr5g_band\"",
+            "AT+QNWPREFCFG=\"lte_band\";+QNWPREFCFG=\"nsa_nr5g_band\";+QNWPREFCFG=\"nr5g_band\"",
         ],
-        "settings" => vec![
-            "AT+QMAP=\"MPDN_RULE\";+QMAP=\"DHCPV6DNS\";+QCFG=\"usbnet\";+QMAP=\"DMZ\";+QMAP=\"DHCPV4DNS\"",
-            "AT+CGSN",
-            "AT+QMAP=\"LANIP\"",
-        ],
+        "settings" => vec!["AT+CGSN"],
         "sms" => vec![SMS_LIST],
         "model" => vec!["AT+CGMM"],
         _ => vec![],
@@ -105,55 +101,83 @@ impl At {
         let overrides = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         let mocks = overrides.clone();
         let sms_changed = Arc::new(tokio::sync::Notify::new());
-        let sms_notify = sms_changed.clone();
+        let worker_sms_changed = sms_changed.clone();
         std::thread::Builder::new()
             .name("at-worker".into())
             .stack_size(128 * 1024)
             .spawn(move || {
                 let fixtures: HashMap<String, String> =
                     serde_json::from_str(include_str!("../tests/fixtures/mock-at.json")).unwrap();
-                let mut port: Option<Port> = None;
+                let mut transport: Option<Box<dyn AtTransport>> = None;
+                let mut connected = false;
                 while let Some(request) = rx.blocking_recv() {
                     if request.reply.is_closed() {
                         continue;
                     }
                     let result = if mock {
-                        Ok(crate::mock::response(
-                            &request.command,
-                            &fixtures,
-                            &mocks.lock().unwrap(),
-                        ))
+                        if transport.is_none() {
+                            transport = Some(Box::new(MockAtTransport::fixture(
+                                fixtures.clone(),
+                                mocks.clone(),
+                            )));
+                        }
+                        let transport = transport.as_mut().unwrap();
+                        if request.command == SMS_LIST {
+                            transport.sms_list()
+                        } else if let Some(storage) = request.storage {
+                            transport.sms_in_storage(storage, &request.command)
+                        } else {
+                            transport.execute(
+                                &request.command,
+                                request.sms.as_deref(),
+                                request.timeout,
+                            )
+                        }
                     } else {
                         (|| -> Result<String> {
-                            if port.is_none() {
+                            if !connected {
                                 let mut last = anyhow::anyhow!("no AT device available");
                                 for path in &devices {
-                                    match Port::open(path, Some(sms_notify.clone())) {
-                                        Ok(p) => {
-                                            port = Some(p);
+                                    match UsbAtTransport::open(
+                                        std::path::Path::new(path),
+                                        Duration::from_secs(10),
+                                    ) {
+                                        Ok(value) => {
+                                            let mut value = Box::new(value);
+                                            value.set_sms_notify(worker_sms_changed.clone());
+                                            transport = Some(value);
+                                            connected = true;
                                             break;
                                         }
-                                        Err(e) => last = e,
+                                        Err(error) => last = error,
                                     }
                                 }
-                                if port.is_none() {
+                                if !connected {
                                     return Err(last);
                                 }
                             }
                             let _lock = global_lock()?;
-                            let p = port.as_mut().unwrap();
-                            let result = if request.command == SMS_LIST {
-                                p.sms_list()
-                            } else if let Some(storage) = request.storage {
-                                p.sms_in_storage(storage, &request.command)
-                            } else {
-                                p.execute(&request.command, request.sms.as_deref(), request.timeout)
+                            let result = {
+                                if request.command == SMS_LIST {
+                                    transport.as_mut().unwrap().sms_list()
+                                } else if let Some(storage) = request.storage {
+                                    transport
+                                        .as_mut()
+                                        .unwrap()
+                                        .sms_in_storage(storage, &request.command)
+                                } else {
+                                    transport.as_mut().unwrap().execute(
+                                        &request.command,
+                                        request.sms.as_deref(),
+                                        request.timeout,
+                                    )
+                                }
                             };
                             if result.is_err() {
-                                p.drain(Duration::from_millis(1000));
-                                if p.disconnected {
-                                    port = None;
+                                if let Some(value) = transport.as_mut() {
+                                    value.drain(Duration::from_millis(100));
                                 }
+                                connected = false;
                             }
                             result
                         })()
@@ -192,7 +216,17 @@ impl At {
         sms: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<String> {
+        policy::validate(command)?;
         self.request(command, sms, timeout, None).await
+    }
+
+    pub async fn sms_list(&self, force: bool) -> Result<String> {
+        self.page("sms", force).await
+    }
+
+    pub async fn sms_send(&self, pdu: String, length: usize) -> Result<String> {
+        self.transaction(&format!("AT+CMGF=0;+CMGS={length}"), Some(pdu))
+            .await
     }
     pub async fn delete_sms(
         &self,
@@ -256,7 +290,8 @@ impl At {
         self.fetch_wait(command, force, true).await
     }
     pub async fn fetch_wait(&self, command: &str, force: bool, wait: bool) -> Result<String> {
-        if policy::action(command) || !cacheable(command) {
+        policy::validate(command)?;
+        if !cacheable(command) {
             let result = self.run(command).await;
             self.invalidate().await;
             return result;
@@ -431,279 +466,6 @@ fn terminal(raw: &str) -> bool {
     })
 }
 
-struct Port {
-    #[cfg(unix)]
-    path: String,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    #[cfg(unix)]
-    tty: Option<std::fs::File>,
-    #[cfg(unix)]
-    _owner: Option<std::fs::File>,
-    disconnected: bool,
-}
-impl Port {
-    #[cfg(unix)]
-    fn open(path: &str, sms_notify: Option<Arc<tokio::sync::Notify>>) -> Result<Self> {
-        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
-        let smd = std::path::Path::new(path)
-            .file_name()
-            .is_some_and(|s| s.to_string_lossy().starts_with("smd"));
-        // A transaction lock alone cannot prevent two persistent readers stealing replies.
-        let owner = if smd { Some(reader_lock()?) } else { None };
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(!smd)
-            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC);
-        let mut reader = options
-            .open(path)
-            .with_context(|| format!("open AT device {path}"))?;
-        if !smd {
-            unsafe {
-                let mut term = std::mem::zeroed();
-                if libc::tcgetattr(reader.as_raw_fd(), &mut term) == 0 {
-                    libc::cfmakeraw(&mut term);
-                    libc::cfsetispeed(&mut term, libc::B115200);
-                    libc::cfsetospeed(&mut term, libc::B115200);
-                    libc::tcsetattr(reader.as_raw_fd(), libc::TCSANOW, &term);
-                }
-            }
-        }
-        let tty = if smd { None } else { Some(reader.try_clone()?) };
-        let (tx, rx) = std::sync::mpsc::sync_channel(16);
-        std::thread::Builder::new()
-            .name("at-reader".into())
-            .stack_size(64 * 1024)
-            .spawn(move || {
-                let mut buf = [0u8; 4096];
-                let mut line = Vec::with_capacity(128);
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if let Some(notify) = &sms_notify {
-                                for byte in &buf[..n] {
-                                    if *byte == b'\n' {
-                                        if line.starts_with(b"+CMTI:") {
-                                            notify.notify_one();
-                                        }
-                                        line.clear();
-                                    } else if *byte != b'\r' && line.len() < 512 {
-                                        line.push(*byte);
-                                    }
-                                }
-                            }
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => break,
-                    }
-                }
-            })?;
-        Ok(Self {
-            path: path.into(),
-            rx,
-            tty,
-            _owner: owner,
-            disconnected: false,
-        })
-    }
-    #[cfg(not(unix))]
-    fn open(_: &str, _: Option<Arc<tokio::sync::Notify>>) -> Result<Self> {
-        bail!("native AT requires Linux; use --mock on Windows")
-    }
-    fn checked(&mut self, command: &str) -> Result<String> {
-        let raw = self.execute(command, None, Some(Duration::from_secs(10)))?;
-        if !crate::parser::ok(&raw) {
-            bail!("SMS command rejected ({command}): {raw}")
-        }
-        Ok(raw)
-    }
-    fn sms_current_storage(&mut self) -> Result<String> {
-        let raw = self.checked("AT+CPMS?")?;
-        let value = raw
-            .lines()
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("+CPMS:")
-                    .and_then(|v| crate::parser::fields(v).first().cloned())
-            })
-            .context("SMS storage query returned no storage")?;
-        if !["ME", "SM", "MT", "SR", "BM"].contains(&value.as_str()) {
-            bail!("unsupported SMS storage")
-        }
-        Ok(value)
-    }
-    fn sms_in_storage(&mut self, storage: crate::sms::Storage, command: &str) -> Result<String> {
-        let previous = self.sms_current_storage()?;
-        let result = (|| {
-            self.checked(&format!("AT+CPMS=\"{}\"", storage.name()))?;
-            let mut raw = String::new();
-            for part in split(command) {
-                raw.push_str(&self.checked(&part)?);
-            }
-            Ok(raw)
-        })();
-        let restored = self.checked(&format!("AT+CPMS=\"{previous}\""));
-        match (result, restored) {
-            (Ok(raw), Ok(_)) => Ok(raw),
-            (Err(error), Ok(_)) => Err(error),
-            (_, Err(error)) => Err(error.context("SMS storage restoration failed")),
-        }
-    }
-    fn sms_list(&mut self) -> Result<String> {
-        self.checked("AT+CMGF=0")?;
-        self.checked("AT+CNMI=2,1,0,0,0")?;
-        let supported = self.checked("AT+CPMS=?")?;
-        let banks = supported
-            .lines()
-            .find_map(|line| {
-                let part = line.trim().strip_prefix("+CPMS:")?;
-                Some(crate::parser::fields(
-                    part.split_once('(')?.1.split_once(')')?.0,
-                ))
-            })
-            .context("SMS storage capabilities missing")?;
-        let mut raw = String::new();
-        for storage in [crate::sms::Storage::ME, crate::sms::Storage::SM] {
-            if banks.iter().any(|s| s == storage.name()) {
-                let response = self.sms_in_storage(storage, "AT+CMGL=4")?;
-                raw.push_str(&format!("+SASTORE: {}\n{response}\n", storage.name()));
-            }
-        }
-        if raw.is_empty() {
-            bail!("no supported SMS storage")
-        }
-        Ok(raw)
-    }
-    fn drain(&self, max: Duration) {
-        let deadline = Instant::now() + max;
-        while Instant::now() < deadline {
-            if self.rx.recv_timeout(Duration::from_millis(30)).is_err() {
-                break;
-            }
-        }
-    }
-    fn write(&mut self, data: &[u8]) -> Result<()> {
-        #[cfg(unix)]
-        {
-            if let Some(file) = &mut self.tty {
-                file.write_all(data)?;
-                return Ok(());
-            }
-            // Match the O_WRONLY|O_TRUNC open used by shell redirection on SMD.
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&self.path)?;
-            file.write_all(data)?;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = data;
-            bail!("native AT requires Linux")
-        }
-    }
-    fn receive(&mut self, timeout: Duration, prompt: bool) -> Result<String> {
-        let deadline = Instant::now() + timeout;
-        let mut out = Vec::new();
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match self.rx.recv_timeout(remaining) {
-                Ok(chunk) => {
-                    if out.len() + chunk.len() > 512 * 1024 {
-                        bail!("AT response too large")
-                    }
-                    out.extend(chunk);
-                    let raw = String::from_utf8_lossy(&out);
-                    if (terminal(&raw) && (!prompt || raw.contains("ERROR")))
-                        || (prompt && raw.trim_end().ends_with('>'))
-                    {
-                        return Ok(raw.into_owned());
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.disconnected = true;
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-        bail!("AT response timed out")
-    }
-    fn execute(
-        &mut self,
-        command: &str,
-        sms: Option<&str>,
-        timeout: Option<Duration>,
-    ) -> Result<String> {
-        if sms.is_some() {
-            let parts = split(command);
-            if let Some((send, setup)) = parts.split_last()
-                && !setup.is_empty()
-            {
-                // Keep setup and interactive submission in the same worker transaction.
-                for part in setup {
-                    let response = self.execute(part, None, timeout)?;
-                    if !crate::parser::ok(&response) {
-                        bail!("SMS setup rejected ({part}): {response}")
-                    }
-                }
-                return self.execute(send, sms, timeout);
-            }
-        }
-        self.drain(Duration::from_millis(150));
-        self.write(format!("{command}\r\n").as_bytes())?;
-        let received = self.receive(
-            timeout.unwrap_or_else(|| {
-                if sms.is_some() {
-                    Duration::from_secs(20)
-                } else {
-                    policy::timeout(command)
-                }
-            }),
-            sms.is_some(),
-        );
-        let mut response = match received {
-            Ok(raw) => raw,
-            Err(error) => {
-                if sms.is_some() {
-                    let _ = self.write(b"\x1b");
-                    self.drain(Duration::from_millis(150));
-                }
-                return Err(error);
-            }
-        };
-        if let Some(pdu) = sms {
-            if !response.trim_end().ends_with('>') {
-                bail!("SMS request rejected before PDU submission ({command}): {response}")
-            }
-            self.write(format!("{pdu}\x1a").as_bytes())?;
-            response.push_str(&self.receive(Duration::from_secs(60), false)?);
-        }
-        Ok(response)
-    }
-}
-#[cfg(unix)]
-fn reader_lock() -> Result<std::fs::File> {
-    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/tmp/simpleadmin-rust-at-reader.lock")?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!(
-            "AT reader already active; use the WebUI AT terminal or stop the service before using the standalone AT command"
-        )
-    }
-    Ok(file)
-}
 #[cfg(unix)]
 fn global_lock() -> Result<std::fs::File> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
@@ -737,6 +499,8 @@ fn global_lock() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
     #[tokio::test]
     async fn background_refresh_does_not_extend_page_interest() {
         let at = At::start(true, vec![]).unwrap();
@@ -797,7 +561,9 @@ mod tests {
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let _slave = unsafe { std::fs::File::from_raw_fd(slave) };
         let notify = Arc::new(tokio::sync::Notify::new());
-        let mut port = Port::open(path, Some(notify.clone())).unwrap();
+        let mut port =
+            UsbAtTransport::open(std::path::Path::new(path), Duration::from_secs(10)).unwrap();
+        port.set_sms_notify(notify.clone());
         let modem = std::thread::spawn(move || {
             let ok = "\r\nOK\r\n";
             let current = "\r\n+CPMS: \"MT\",0,100,\"ME\",0,100,\"SM\",0,100\r\nOK\r\n";
@@ -897,7 +663,8 @@ mod tests {
             .to_owned();
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let _slave = unsafe { std::fs::File::from_raw_fd(slave) };
-        let mut port = Port::open(&path, None).unwrap();
+        let mut port =
+            UsbAtTransport::open(std::path::Path::new(&path), Duration::from_secs(10)).unwrap();
         let modem = std::thread::spawn(move || {
             fn read_until(file: &mut std::fs::File, end: u8) -> Vec<u8> {
                 let mut data = Vec::new();

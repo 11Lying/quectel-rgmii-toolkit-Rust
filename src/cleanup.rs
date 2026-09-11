@@ -171,7 +171,7 @@ impl Cleanup {
         if due.is_empty() {
             return Ok(());
         }
-        let raw = at.page("sms", true).await?;
+        let raw = at.sms_list(true).await?;
         if !parser::ok(&raw) {
             bail!("SMS read failed")
         }

@@ -1,6 +1,7 @@
 mod actions;
 mod at;
 mod at_policy;
+mod at_transport;
 mod auth;
 mod cell_lock;
 mod cleanup;
@@ -9,6 +10,7 @@ mod forwarding;
 mod http;
 mod install_credentials;
 mod mock;
+mod network_status;
 mod parser;
 mod persistence;
 mod resolver;
@@ -17,6 +19,7 @@ mod sms;
 mod system;
 mod telemetry;
 mod tls;
+mod usb_discovery;
 mod webui;
 
 use anyhow::{Result, bail};
@@ -26,11 +29,11 @@ use std::path::PathBuf;
 #[derive(Parser, Clone, Debug)]
 #[command(version, about = "Quectel RGMII administration server")]
 pub struct Config {
-    #[arg(long = "static", default_value = "/usrdata/simpleadmin/www")]
+    #[arg(long = "static", default_value = "/usr/share/simpleadmin/www")]
     pub static_dir: PathBuf,
-    #[arg(long, default_value = "/usrdata/simpleadmin/simpleadmin.auth")]
+    #[arg(long, default_value = "/etc/simpleadmin/auth")]
     pub auth_file: PathBuf,
-    #[arg(long, default_value = ":80")]
+    #[arg(long, default_value = "127.0.0.1:8080")]
     pub http: String,
     #[arg(long, default_value = ":443")]
     pub https: String,
@@ -38,19 +41,17 @@ pub struct Config {
     pub no_tls: bool,
     #[arg(long,default_value_t=false,action=clap::ArgAction::Set,num_args=0..=1,default_missing_value="true",require_equals=true)]
     pub mock: bool,
-    #[arg(long, default_value = "/usrdata/simpleadmin/ttlvalue")]
-    pub ttl_file: PathBuf,
     #[arg(long, default_value = "")]
     pub at_devices: String,
-    #[arg(long, default_value = "/usrdata/simpleadmin/at_devices.conf")]
+    #[arg(long, default_value = "/etc/simpleadmin/at_devices.conf")]
     pub at_devices_file: PathBuf,
-    #[arg(long, default_value = "/usrdata/simpleadmin/server.crt")]
+    #[arg(long, default_value = "/etc/simpleadmin/server.crt")]
     pub cert: PathBuf,
-    #[arg(long, default_value = "/usrdata/simpleadmin/server.key")]
+    #[arg(long, default_value = "/etc/simpleadmin/server.key")]
     pub key: PathBuf,
-    #[arg(long, default_value = "/usrdata/simpleadmin/zbims-ca.crt")]
+    #[arg(long, default_value = "/etc/simpleadmin/ca.crt")]
     pub ca_cert: PathBuf,
-    #[arg(long, default_value = "/usrdata/simpleadmin/zbims-ca.key")]
+    #[arg(long, default_value = "/etc/simpleadmin/ca.key")]
     pub ca_key: PathBuf,
     #[arg(long, default_value_t = false)]
     pub at_debug: bool,
@@ -77,13 +78,23 @@ fn collect_devices(explicit: &str, file: &std::path::Path) -> Vec<String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if path == "/dev/smd11" && !devices.contains(&path.to_string()) {
-                devices.push(path.into())
+            if path.starts_with("/dev/ttyUSB")
+                || path.starts_with("/dev/ttyACM")
+                || path.starts_with("/dev/serial/by-id/")
+            {
+                let path = path.to_owned();
+                if !devices.contains(&path) {
+                    devices.push(path)
+                }
             }
         }
     }
     if devices.is_empty() {
-        devices.push("/dev/smd11".into())
+        devices.extend(
+            usb_discovery::discover()
+                .into_iter()
+                .map(|candidate| candidate.path.to_string_lossy().into_owned()),
+        );
     }
     devices
 }
@@ -91,7 +102,7 @@ fn collect_devices(explicit: &str, file: &std::path::Path) -> Vec<String> {
 struct AtCommand {
     #[arg(long, default_value = "")]
     devices: String,
-    #[arg(long, default_value = "/usrdata/simpleadmin/at_devices.conf")]
+    #[arg(long, default_value = "/etc/simpleadmin/at_devices.conf")]
     devices_file: PathBuf,
     #[arg(long, default_value_t = 1000)]
     timeout_ms: u64,
@@ -102,7 +113,7 @@ struct AtCommand {
 }
 pub fn listen_address(raw: &str) -> String {
     if raw.starts_with(':') {
-        format!("0.0.0.0{raw}")
+        format!("127.0.0.1{raw}")
     } else {
         raw.into()
     }
@@ -128,13 +139,9 @@ fn entry() -> Result<()> {
         return install_credentials::run(args.iter().any(|arg| arg == "--check"));
     }
     if sub == "root-password-init" {
-        let store = persistence::Store::new(false);
-        let marker = PathBuf::from("/usrdata/simpleadmin/root-password.initialized");
-        if !marker.exists() {
-            auth::change_root(&store, "", "admin", true)?;
-            store.write(&marker, b"1\n", 0o600)?
-        }
-        return Ok(());
+        bail!(
+            "root password initialization is disabled; configure ImmortalWrt root credentials separately"
+        );
     }
     if sub == "passwd" {
         use std::io::Read;
@@ -146,11 +153,12 @@ fn entry() -> Result<()> {
             .windows(2)
             .find(|p| p[0] == "--auth-file")
             .map(|p| PathBuf::from(&p[1]))
-            .unwrap_or_else(|| PathBuf::from("/usrdata/simpleadmin/simpleadmin.auth"));
+            .unwrap_or_else(|| PathBuf::from("/etc/simpleadmin/auth"));
         let (user, _) = auth::read(&path).unwrap_or(("admin".into(), String::new()));
+        let password_hash = auth::hash_password(password)?;
         persistence::Store::new(false).write(
             &path,
-            format!("{user}:{password}\n").as_bytes(),
+            format!("{user}:{password_hash}\n").as_bytes(),
             0o600,
         )?;
         return Ok(());
@@ -181,44 +189,12 @@ fn entry() -> Result<()> {
             Ok(())
         });
     }
-    if sub == "ttl" {
-        let action = args.get(2).map(String::as_str).unwrap_or("status");
-        return runtime.block_on(async {
-            let path = PathBuf::from("/usrdata/simpleadmin/ttlvalue");
-            let value = system::ttl(&path);
-            match action {
-                "status" => println!("enabled={} ttl={value}", value > 0),
-                "apply" | "start" | "restart" => {
-                    for line in system::apply_ttl(value, false).await? {
-                        println!("{line}")
-                    }
-                }
-                "off" | "stop" => {
-                    system::set_ttl(
-                        0,
-                        false,
-                        &path,
-                        std::sync::Arc::new(persistence::Store::new(false)),
-                    )
-                    .await?;
-                }
-                _ => bail!("invalid ttl action"),
-            }
-            Ok(())
-        });
-    }
     if sub == "serve" {
         args.remove(1);
     }
     let config = Config::parse_from(args);
     runtime.block_on(async move {
         let app = server::App::new(config)?;
-        if !app.config.mock {
-            let value = system::ttl(&app.config.ttl_file);
-            if value > 0 {
-                system::apply_ttl(value, false).await?;
-            }
-        }
         app.start();
         if app.config.no_tls {
             let listener = tokio::net::TcpListener::bind(listen_address(&app.config.http)).await?;

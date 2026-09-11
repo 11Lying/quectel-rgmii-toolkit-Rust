@@ -41,12 +41,21 @@ pub fn read(path: &Path) -> Result<(String, String)> {
     if user.is_empty() {
         bail!("empty username")
     }
+    if !pass.starts_with('$') {
+        bail!("authentication file must contain a password hash")
+    }
     Ok((user.into(), pass.into()))
 }
+
+pub fn hash_password(password: &str) -> Result<String> {
+    validate(password)?;
+    let params = sha_crypt::Sha512Params::new(5000).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    sha_crypt::sha512_simple(password, &params).map_err(|e| anyhow::anyhow!("{e:?}"))
+}
 impl Auth {
-    pub fn new(path: PathBuf, store: &Store) -> Result<Self> {
+    pub fn new(path: PathBuf, _store: &Store) -> Result<Self> {
         if !path.exists() || std::fs::metadata(&path)?.len() == 0 {
-            store.write(&path, b"admin:admin\n", 0o600)?
+            bail!("authentication is not initialized; set a password before starting")
         }
         read(&path)?;
         Ok(Self {
@@ -228,7 +237,13 @@ mod tests {
     #[test]
     fn revoked_sessions_notify_sockets() {
         let dir = tempfile::tempdir().unwrap();
-        let auth = Auth::new(dir.path().join("auth"), &Store::new(true)).unwrap();
+        let path = dir.path().join("auth");
+        std::fs::write(
+            &path,
+            format!("admin:{}\n", hash_password("test-password").unwrap()),
+        )
+        .unwrap();
+        let auth = Auth::new(path, &Store::new(true)).unwrap();
         let token = auth.create();
         let receiver = auth.watch(&token).unwrap();
         assert!(auth.valid(&token, false));

@@ -75,7 +75,7 @@ pub async fn change_port(app: &Arc<App>, p: &crate::actions::Params) -> Response
         Ok(c) => c,
         Err(_) => return failure(500, "auth config error"),
     };
-    if !auth::equal(p.get("current_password"), &password) {
+    if !auth::verify_hash(p.get("current_password"), &password) {
         return failure(403, "current password incorrect");
     }
     let raw = p.get("http_port");

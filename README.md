@@ -1,169 +1,199 @@
-# Quectel RGMII Toolkit · Rust
+# SimpleAdmin for RM502Q-AE on ImmortalWrt
 
-面向移远 RM520N-EU 的轻量设备管理后台。Rust 原生后端，保留 Go 版的页面、AT 操作和安装方式，支持中文、English、Русский、العربية。
+SimpleAdmin 的 Quectel modem WebUI 移植版本，目标环境为 H5000M、ImmortalWrt、ARM64 和 RM502Q-AE。
 
-[下载离线安装包](https://github.com/tcpqueue/quectel-rgmii-toolkit-Rust/releases/latest) · [功能核对与真机测试](docs/validation.md) · [构建说明](docs/build.md) · [Go 原项目](https://github.com/snjzb/quectel-rgmii-toolkit-Go)
+它保留 baseline 中的 modem-management 业务：WebUI、`At` 队列和缓存、AT parser、HTTP API、SMS 和 Modem AT Console。移植只替换运行环境与 AT 连接方式：modem AT 通过 USB serial 访问，网络数据面交给 ImmortalWrt。
 
-![总览界面](docs/images/overview.png)
+```text
+SimpleAdmin WebUI / Modem AT Console
+  -> existing modem-management logic (`At`)
+  -> USB serial AT port
+  -> RM502Q-AE
 
-> 截图使用模拟数据。已在 RM520N-EU 真机安装测试，其他型号和固件尚未完成实机验证。
-
-**v0.2.6 短信更新：** 对齐 VoHive 的 AT 短信编码与发送握手，支持短号码、GSM-7/UCS2 自动编码、ME/SM 收件箱和新短信通知。此版本短信收发仅做离线及模拟串口验证，没有进行真实短信发送。参见 [短信兼容性与验证范围](docs/sms-compatibility.md)。
-
-## 安装
-
-1. 下载单文件 `SimpleAdmin-Setup.exe`；若下载 `offline.zip`，解压后也只有这一个 EXE。
-2. 将模块连接到 Windows 电脑。EXE 已内嵌 ADB、设备程序、网页和安装资源，无需另附文件夹或联网下载依赖。
-3. 双击 **`SimpleAdmin-Setup.exe`** 打开“移远高通系列5G模块配置与维护”，选择模块，点击 **安装 / 升级**。等待文件校验、服务和 HTTP 页面检查通过。
-   如需自定义端口，先勾选“修改 HTTP 端口”，填写 `1–65535` 的端口，例如 `8080`。不勾选时，首次安装使用 `80`，升级保留原端口。
-   下方实时日志默认展开，逐行显示执行时间和输出；取消“自动滚动到最新日志”即可查看前面的记录。
-4. 浏览器访问模块地址，通常为 `http://192.168.225.1`。首次打开先选择语言，再使用 `admin / admin` 登录。
-   自定义为 `8080` 时，访问 `http://192.168.225.1:8080/`。设备助手的“打开管理页面”和“故障诊断”会自动读取已保存的端口。
-
-也可以通过 ADB 转发访问：
-
-```powershell
-.\adb.exe forward tcp:18081 tcp:80
+RM502Q-AE USB QMI
+  -> /dev/cdc-wdmX + qmi_wwan
+  -> wwan0
+  -> ImmortalWrt netifd
+  -> routing / DNS / firewall / OpenClash
 ```
 
-随后打开 `http://127.0.0.1:18081`。
-若模块使用自定义端口，请将命令右侧的 `tcp:80` 改为对应端口，例如 `tcp:8080`；左侧是电脑本地端口。
+SimpleAdmin 不负责 QMI 拨号、路由、防火墙、DNS、OpenClash 或 `wwan0` / netifd 生命周期。它只管理 modem AT control plane，并读取固定的主机网络状态。
 
-端口保存在模块 `/usrdata/simpleadmin/http_port`，安装时先将根目录挂载为读写，写入完成后恢复只读。相同值不重复写入；开机仅读取配置。修改端口后自动重启应用，无需重启模块。新端口已被占用时，安装器会在停止原服务前报错。
-若固件已有针对 `rmnet*` 接口的 TCP 80 DROP 规则，启动时会对自定义端口添加同样的限制，并置于放行规则之前，保留这项移动网络访问限制。
+## Upstream and baseline
 
-![Windows 设备助手](docs/images/windows-installer.png)
+- Upstream / baseline: [`tcpqueue/quectel-rgmii-toolkit-Rust`](https://github.com/tcpqueue/quectel-rgmii-toolkit-Rust)
+- Baseline release: `v0.2.6`
+- Baseline commit: `1f3dbf1a965c3c564f46cc1ea630b23c7fd2f686`
+- License: MIT; upstream notices and third-party frontend licenses remain in the repository.
 
-[查看深色界面](docs/images/windows-installer-dark.png)
+This is not a rewrite. The port keeps the baseline modem-management logic, AT commands, parser contracts, API behavior and WebUI where they apply to an external RM502Q-AE. Only the platform boundary and hardware transport were changed as required.
 
-“移远高通系列5G模块配置与维护”采用原生 **WinUI 3** 中文界面，支持系统深浅色主题、自动检测、多设备选择、分步进度、实时日志、故障诊断、打开管理页面和查看报告。面向 **Windows 10 2004（19041）及以上 / Windows 11，x64**；截图使用模拟设备。
+## Migration / porting
 
-单文件 EXE 内置 Windows App SDK、.NET 和 ADB，用户无需另装运行库或联网下载。启动时自动解压到电脑临时目录，因此包体比旧安装器大；这些运行库只在电脑运行，模块上的 Rust 程序和资源占用不受影响。
+### Runtime environment
 
-点击 **打开管理页面** 会检查登录页，并通过自动分配的空闲 ADB 转发端口打开浏览器。ADB 通道能打开页面，只证明应用可用；通过模块 IP 访问还取决于网卡、路由与固件防火墙。保持 USB 连接即可使用该通道。
+The baseline targeted an RM520N internal Linux/AP environment. This port runs `simpleadmin-httpd` on an external H5000M router running ImmortalWrt. The package targets the ImmortalWrt ARM64 musl toolchain.
 
-对外部署只需发送 EXE。内部安装资源运行时解压到 Windows 临时目录，退出时尽量清理；被共享 ADB 服务占用的文件保留到系统清理临时目录，不强制关闭 ADB。图形操作报告保存在 `%LOCALAPPDATA%/SimpleAdmin/Reports`，可点击“查看报告”。安装过程中请保持 USB 连接，不要断电。
+### AT transport
 
-**安装后打不开网页：** 在设备助手中点击“故障诊断”，然后“查看报告”。也可诊断旧版本，不重新安装、不重启、不执行 AT 指令、不读取短信或密码。报告包含设备序列号和网络地址，分享前可自行遮盖。参见 [安装排查](docs/install-troubleshooting.md)。
+`UsbAtTransport` replaces the fixed internal serial path. It accepts configured USB serial paths from `SIMPLEADMIN_AT_DEVICES`, `--at-devices`, or `/etc/simpleadmin/at_devices.conf`; if none are configured, discovery lists available `/dev/serial/by-id/*`, `/dev/ttyUSB*`, and `/dev/ttyACM*` candidates. No fixed tty number is assumed.
 
-默认安装会读取当前 bridge0 MAC，并保存到固件支持的 QCMAP 配置，让下次启动沿用当前地址。不会生成新 MAC、切换当前地址、重启 QCMAP 或要求重启设备；相同配置不重复写入。读取失败或固件字段不支持时会显示警告并跳过。维护时可设置 `SIMPLEADMIN_FIX_BRIDGE0_MAC=0` 禁用此步骤。
+The USB transport uses raw 115200 baud serial I/O, a dedicated reader thread, bounded buffering, response termination for `OK`, `ERROR`, `+CME ERROR`, and `+CMS ERROR`, fragmented `+CMTI` notification handling, SMS prompt/PDU handling, storage restoration, and ESC cleanup after an interactive SMS failure. Grouped AT commands remain grouped except for required SMS setup before `AT+CMGS`.
 
-**升级已有 Go 版：** 直接运行安装工具。脚本停止旧进程、替换程序和页面，保留有效的 Web 登录凭据、TTL、监测目标和 root 密码初始化标记；无需先卸载。未自定义时，首次安装将系统 root 密码初始化为 `admin`，已有初始化标记时不重置密码。
+Identify the actual interfaces on the target device before configuration:
 
-**修改密码：** 登录后进入系统设置，可分别修改 Web 登录密码和系统 root 密码，需要验证当前密码。修改后现有会话失效，重新登录即可。两种密码独立保存。
+```sh
+lsusb
+lsusb -t
+dmesg | tail -n 200
+ls -l /dev/serial/by-id /dev/ttyUSB* /dev/ttyACM* /dev/cdc-wdm* 2>/dev/null
+ip link
+```
 
-**升级：** 直接使用设备助手“安装 / 升级”，无需先卸载。卸载维护脚本保留在源码中，不作为单文件安装器的对外附件。
+Prefer a stable `/dev/serial/by-id/...` alias when available. USB VID/PID, interface numbering, tty mapping and default AT port for RM502Q-AE remain hardware-validation items.
 
-### 一页完成连接、配置与安装
+### Network data plane
 
-左侧流程图依次为 **识别模块 → ADB 连接 → 联网配置 → 安装升级 → 检查完成**。所有区域放在同一页，点击步骤即可定位；已有 ADB 连接可直接跳到安装升级。
+ImmortalWrt owns the QMI path: `qmi_wwan`, `/dev/cdc-wdmX`, `wwan0`, netifd, IPv4/IPv6 addressing, routing, DNS, firewall and OpenClash. SimpleAdmin does not invoke `uqmi`, `ifup`, `ifdown`, network reloads, or modem data-plane setup.
 
-![移远高通连接准备](docs/images/windows-prepare.png)
+## Preserved modem-management features
 
-1. 刷新串口，选择 **Quectel USB AT Port**，点击 **识别模块**。关闭占用串口的其他工具，设备 USB 驱动按系统识别情况安装。
-2. 点击 **检查并解锁 ADB**。先读取 USB 配置的倒数第二项，为 **1 或 2** 时直接跳过；仅在 **0** 时预览把倒数第二项置为 **2** 的指令，不计算或发送 ADB 密钥。VID 校验为移远 **2C7C**，PID 使用模块原值，不限定具体编号；其他 USB 接口参数也保持原值。
-3. 需要联网配置时选择 **PCIe 转网口、ECM 或 RNDIS**。先查询已有 MPDN 规则，存在规则 0 时执行 AT+QMAP="MPDN_RULE",0 关闭，再使用 AT+QMAPWAC=1 自动拨号，不创建 MPDN 规则。PCIe 方案按转接板选择 RTL8125 / RTL8168；ECM、RNDIS 使用 USB 数据接口及对应网卡模式。
-4. 安装区域可自定义 **HTTP 端口、Web 账号与密码、系统 root 密码**。首次默认端口 **80**，账号和两种密码均为 **admin**；升级不勾选则保留已有值，勾选后才应用填写的值。Web 账号支持 1–64 位字母、数字、点、下划线和短横线。
-5. 等待安装与 HTTP 检查完成，点击 **打开管理页面**。网络配置如需重启，单独点击 **重启模块** 并确认，不自动重启。
+Except for the removed legacy scope below, baseline modem-management behavior is retained:
 
-密码通过标准输入和 ADB exec-in 传递，不拼入命令行、不记录在日志，也不在电脑创建密码文件。模块仅在 /tmp 暂存凭据，校验内容后执行；持久化时先挂载为读写，完成后恢复只读。相同配置不重复写入。
+- Dashboard, device information, SIM status, signal, serving cell, CA and temperature.
+- `QGDNRCNT` / `QGDCNT` traffic counters, in-memory traffic trend and rate display.
+- Band lock/reset, frequency selection, LTE and NR cell lock, cell scan, persistent cell lock and auto-unlock.
+- SIM slot switching with `AT+QUIMSLOT`.
+- Network mode, NR disable mode and APN/PDP configuration.
+- SMS listing, send, delete, ME/SM storage handling and forwarding.
+- AT cache, compatible manual-AT API and browser Modem AT Console.
+- IMEI read/write, modem reboot/reset and `AT&F` reset, with explicit confirmation for writes.
+- Existing parser, SMS, forwarding and cell-lock behavior unless a target response format later requires a minimal parser or transport correction.
 
-**设备信息**按项读取 SIM 状态、信号、温度、APN、频段与接口配置，不持续轮询。**高级 AT 工具**支持最多 32 条逐行指令、常用查询与本机保存，遇错停止。已执行的配置不会自动回滚；恢复出厂需要单独确认。
+RM502Q-AE has not yet been validated on hardware. That does not hide, remove or return a hardware-capability denial for these normal modem features.
 
-准备页开放已列入适配范围的移远高通型号：RM500Q、RM502Q、RM520N、RM521F、RG500Q、RG502Q、RG520N、RG520F、RG521F 系列。这是协议检查范围，不代表所有型号均已实机验证。原始 USB 返回值会显示在操作记录中，不计算 ADB 密钥；不提供短信发送或删除指令。
+## Removed legacy features
 
-## 功能
+The following baseline features are deliberately not migrated:
 
-| 页面 | 内容 |
-| --- | --- |
-| 总览 | CPU、内存、网络状态、流量、频段、小区、信号和天线读数 |
-| 网络与小区 | APN、网络模式、频段选择、LTE/NR 小区扫描、临时/持久化锁小区及三分钟拨号失败回退 |
-| 系统设置 | Web/root 密码、TTL、IP 透传、DNS 代理、USB 网络模式、DMZ、LAN IP、AT 终端 |
-| 短信服务 | 收件箱、分段发送、转发设置合并为同一页；Server酱 Turbo、企业微信、钉钉、飞书、Webhook、本卡短信，附各渠道对接教程 |
-| 设备信息 | 型号、版本、SIM 和设备标识等信息 |
-| 控制台 | 使用系统 root 密码认证的原生 PTY 终端 |
+- RM520N internal CPU and RAM monitoring, and TTL control. They are not replaced with H5000M host CPU/RAM monitoring.
+- Ping telemetry: Ping target/configuration and persistence, RTT, jitter, packet loss, history, charts, summaries, `/api/get_ping`, and `/api/telemetry/target`.
+- Internal Linux/AP control: shell, PTY, `/bin/sh`, arbitrary Linux command execution and internal system management.
+- RM520N gateway/data-plane control: active QMAP, NAT, DHCP, DNS, DMZ, LAN IP, IP passthrough, RGMII, legacy PCIe data-plane topology, old AP/gateway behavior, `QCFG="usbnet"` and USB-composition control.
 
-UI 延续 Art Design Pro 的布局和配色，静态资源本地提供，支持明暗主题、移动端和阿拉伯语从右到左布局。总览把主要信息放在上方，趋势图放在下方；读不到 4G 数据时隐藏相关读数与图例，SINR 为 0 的有效数据正常显示。
+Historical QMAP parser or fixture support may remain for cache and test compatibility. It does not restore active QMAP data-plane control. The normal Modem AT Console remains available; it is not a router shell.
 
-## 五分钟趋势
+## AT architecture
 
-短信与锁频的新增配置详见 [短信转发与持久化锁频](docs/sms-cell-lock.md)。
+```text
+WebUI / compatible manual-AT API / Modem AT Console
+  -> Axum HTTP and WebSocket API
+  -> At queue, cache, parser and modem actions
+  -> UsbAtTransport
+  -> /dev/serial/by-id/*, /dev/ttyUSB*, or /dev/ttyACM*
+  -> RM502Q-AE
+```
 
-![信号、温度与延迟走势](docs/images/monitoring.png)
+There is no Adapter/profile layer or capability feature gate. Manual AT and Console writes still require authentication, validation, an explicit confirmation, and audit logging. Only explicitly retired gateway/data-plane AT command families are rejected.
 
-| 数据 | 周期 | 保留量 | 存储 |
-| --- | --- | --- | --- |
-| Ping RTT / Jitter | 1 秒 | 最近 5 分钟，最多 300 点 | 内存 |
-| RSRP / SINR / 温度 | 5 秒 | 最近 5 分钟，最多 60 点 | 内存 |
-| 下载 / 上传速率与流量占比 | 5 秒 | 最近 5 分钟，最多 60 点 | 内存 |
+## Build and install
 
-- 默认 Ping `www.baidu.com`，可改为域名、IPv4 或 IPv6 地址。
-- 采集由设备后台运行，关闭网页后继续；重启程序后历史清空。
-- RSRP 与 SINR 共用图表，分别使用左右坐标轴。温度单独绘图。
-- 下载与上传共用双折线图，按实际 AT 采样间隔计算速率，重复缓存不产生虚假的零速率。占比按近五分钟有效采样区间的上下行字节数计算；无流量时显示空占比。
-- 单点 Jitter 为 `abs(RTT[n] - RTT[n-1])`，平均抖动为窗口内有效差值的算术平均。丢包、采样间断和窗口外的数据不参与跨点配对。
-- DNS 解析失败与 ICMP 超时分别记录。Ping 结果表示目标的 ICMP 可达性。
+### Build an ImmortalWrt package
 
-## 短信转发
+Use the matching ImmortalWrt SDK and its ARM64 musl toolchain. Place this repository where the package Makefile expects it, then run from the SDK root:
 
-![短信转发配置](docs/images/sms-hub.png)
+```sh
+make package/simpleadmin/compile V=s
+```
 
-短信页提供功能总开关，以及默认关闭的“全部渠道转发成功 24 小时后自动删除”。关闭短信功能会停止应用的短信轮询、发送操作及转发，SIM 卡仍可接收运营商短信。
+The generated package is `bin/packages/*/base/simpleadmin_*.ipk`. See [docs/BUILD_IMMORTALWRT.md](docs/BUILD_IMMORTALWRT.md).
 
-在“短信服务 → 转发设置”中填写设备名称和推送凭据，可同时启用多个渠道。Server酱使用 Turbo 的 SCT SendKey；企业微信、钉钉和飞书使用群机器人 Webhook，钉钉、飞书支持签名密钥。新增“本卡短信”可向指定号码发送转发内容，每个渠道的表单旁均有对应教程。
+### Install on the router
 
-- 推送包含发送号码、完整正文、接收时间和设备名称，长短信等待分段齐全。
-- 每 10 秒检查新短信，关闭网页后继续。启动或重新启用时，已有短信不补发。
-- 失败任务最多保留 3 分钟，队列和最近 50 条结果仅在内存中，重启后未完成任务不补发。
-- 本卡转发可能按分段产生短信费用，未确认发送不会自动重试；不提供本卡渠道测试按钮。来自目标号码的短信不会转回目标号码。
-- 可选自动删除以所有启用渠道确认成功的时间起算，至少等待 24 小时。删除凭据只保存存储位置、指纹与时间，按分钟合并写入；位置被复用时取消任务。为防止设备从 1970 年校时后提前删除，额外要求完整的 24 小时单调计时；重启程序或系统时间异常会重新等待至少 24 小时，不触发短信重发。
+1. Configure the QMI WAN interface in ImmortalWrt first; confirm `qmi_wwan`, `/dev/cdc-wdmX`, and `wwan0` work independently of SimpleAdmin.
+2. Install `simpleadmin_*.ipk`.
+3. Configure `/etc/config/simpleadmin`. Its defaults bind the WebUI to `192.168.1.1:8080`, use `/usr/share/simpleadmin/www`, and read authentication from `/etc/simpleadmin/auth`.
+4. Create a password hash; do not put a plaintext password in the auth file:
 
-配置步骤、Webhook 格式、计费和锁频回退见 [短信与锁频说明](docs/sms-cell-lock.md)，去重和存储边界见 [短信功能说明](docs/sms.md)。截图为模拟数据。
+   ```sh
+   mkdir -p /etc/simpleadmin
+   umask 077
+   printf %s "choose-a-password" | /usr/bin/simpleadmin-httpd passwd
+   chmod 600 /etc/simpleadmin/auth
+   ```
 
-## 资源与存储
+5. Configure the AT port in `/etc/simpleadmin/at_devices.conf` if automatic discovery is not appropriate. Use one path per line, for example `/dev/serial/by-id/...` or `/dev/ttyUSB2`.
+6. Enable and start the service:
 
-后端使用单线程异步运行时、一个 AT 工作线程及一个串口读取线程，直接访问 `/dev/smd11`，不再启动 Go SMD 辅助进程或 `socat`。请求串行执行，短信的提示符、PDU 和结束响应属于同一事务。
+   ```sh
+   /etc/init.d/simpleadmin enable
+   /etc/init.d/simpleadmin start
+   ```
 
-历史数据采用固定长度环形数组和定点数，三类历史的原始数组合计不超过 **8,160 字节**。AT 队列最多 16 个请求，缓存最多 64 项、响应内容合计最多 1 MiB，会话与 WebSocket 也有数量限制。这些是内部缓冲区上限，不代表程序总内存占用。
+7. Open `http://192.168.1.1:8080/`, or the `listen_addr` and `port` configured in UCI.
 
-持久化设置统一执行 **根目录 rw → 写临时文件 → 同步 → 原子替换 → 根目录 ro**。内容不变时跳过写入；曲线、会话、锁文件均留在内存或 tmpfs。服务仅在 `/tmp` 为 tmpfs 时保留当次启动消息或退出错误，每次启动覆盖，不输出持续日志；控制台不写 shell 历史。应用目录及可执行文件权限为 `777`，认证文件为 `600`。
+The runtime binary is `/usr/bin/simpleadmin-httpd`; static files are `/usr/share/simpleadmin/www/`; configuration and persistent application state are under `/etc/simpleadmin/`. The procd service starts HTTP with `--no-tls=true` using the UCI listener values. See [docs/DEVICE_DEPLOY.md](docs/DEVICE_DEPLOY.md).
 
-v0.1.0 在 RM520N-EU 同条件后台采样中，CPU 约 **1.46% → 0.45%**，PSS 内存约 **7.25 MiB → 1.40 MiB**；正常页面访问场景下 Rust 约 **3.1 MiB**。ARM 程序从 7.93 MB 缩小到约 4.15 MB。历史基线的采样条件与适用范围见 [验证记录](docs/validation.md)。
+### Local development checks
 
-短信转发默认关闭，HTTP 客户端在首次推送时初始化。只有启用自动删除后，已确认转发的短信才额外保存删除凭据；未启用时不为每条转发写入文件。
+```sh
+cargo fmt --check
+cargo check
+cargo test
+node tests/traffic-ui.cjs
+```
 
-Ping 和短信转发的 DNS 查询分别限制为最多一个，独立于网页文件读取线程；离线或 DNS 卡住时后台仍可访问。图表首次获取五分钟全量数据，随后只传新增采样；非监测页面的 AT 缓存超过两分钟无人访问时停止主动刷新，重新访问会恢复。普通 HTTP 同时最多 32 条连接，API WebSocket 最多 8 条、终端最多 2 条，并限制慢请求与单条消息大小。
+The Rust test suite uses mock AT data. It does not replace device validation.
 
-## 界面与语言
+## Hardware validation
 
-![首次登录与语言选择](docs/images/login.png)
+Software checks pass, but RM502Q-AE on H5000M has not yet been validated. On first hardware access, record the raw results described in [docs/DEVICE_FIRST_BOOT.md](docs/DEVICE_FIRST_BOOT.md) and [docs/RM502QAE_FIRST_AT.md](docs/RM502QAE_FIRST_AT.md).
 
-| 中文移动端 | العربية |
-| --- | --- |
-| ![中文移动端](docs/images/mobile.png) | ![阿拉伯语移动端](docs/images/arabic-mobile.png) |
+Validate, at minimum:
 
-语言选择保存在当前浏览器中，不因切换语言反复写入模块存储。旧版语言 API 仍保留兼容。
+1. USB enumeration, `/dev/serial/by-id`, `ttyUSB`/`ttyACM`, `cdc-wdm`, and QMI interface mapping.
+2. `AT`, `ATI`, manufacturer/model/firmware, SIM state and SIM switching.
+3. Signal, serving cell, CA, band queries, band/frequency/cell lock, scan, network mode and NR-disable behavior.
+4. APN/PDP, SMS read/send/delete/forwarding, temperature, reboot/reset, IMSI/IMEI operations and `AT&F`.
+5. QMI, `wwan0`, IPv4, IPv6 and netifd operation outside SimpleAdmin.
+6. `QGDNRCNT` / `QGDCNT` traffic-counter format and resulting traffic telemetry.
 
-## Windows 预览
+Unverified hardware formats are not disabled features. They only determine whether a small parser or transport adjustment is required after raw responses are collected.
 
-双击 `windows-test/start.bat`，打开 `http://127.0.0.1:8080`，默认 `admin / admin`。该模式使用模拟 AT 和监测数据，便于预览页面；不能代替模块硬件测试。
+## Project structure
 
-## 开发
+```text
+src/                         Rust HTTP service and modem logic
+development/simpleadmin/www/ WebUI assets packaged to /usr/share/simpleadmin/www
+package/simpleadmin/         ImmortalWrt package Makefile, UCI defaults and procd service
+tests/                       Rust integration modules, fixtures and browser/Node regressions
+docs/                        Architecture, deployment, validation and migration records
+scripts/                     Historical build/package helper scripts
+installer/, windows-test/    Historical Windows baseline assets; not ImmortalWrt runtime dependencies
+```
 
-源码、锁定依赖、ARMv7 静态可执行文件及 Windows 预览程序均随仓库提供。编译与打包步骤见 [docs/build.md](docs/build.md)。WSL 中请在 Linux 原生目录构建，例如 `~/projects/`；`/mnt/...` 只用于传输文件。
+Important backend files:
 
-## 来源与许可
+- `src/at.rs`: serialized `At` queue, cache, page command groups, SMS transactions and USB reconnection boundary.
+- `src/at_transport.rs`: raw USB serial transport, reader thread, URC and interactive SMS handling.
+- `src/parser.rs`: modem response parsing, including serving-cell, CA, PDP and traffic-counter data.
+- `src/actions.rs`, `src/cell_lock.rs`: validated modem setting actions, band/cell lock and persistence.
+- `src/sms.rs`, `src/forwarding.rs`, `src/cleanup.rs`: SMS PDU handling, forwarding and deferred cleanup.
+- `src/telemetry.rs`: signal and modem traffic in-memory history; Ping is intentionally absent.
+- `src/server.rs`, `src/webui.rs`, `src/auth.rs`: Axum API, WebUI serving and authentication.
+- `src/console.rs`, `src/console.html`: authenticated WebSocket Modem AT Console.
+- `src/usb_discovery.rs`, `src/network_status.rs`: serial candidate discovery and fixed read-only host network status.
 
-基于 [snjzb/quectel-rgmii-toolkit-Go](https://github.com/snjzb/quectel-rgmii-toolkit-Go) 的功能和前端迁移，保留原项目 MIT 许可与署名。界面参考 [Art Design Pro](https://github.com/Daymychen/art-design-pro)，图表和图标使用 ECharts、Lucide。相关前端许可位于 `development/simpleadmin/www/licenses/`。Rust 依赖版本见 `Cargo.lock`。
+## Documentation
 
-移远高通准备流程参考用户提供的 ADBUnlockTool v1.33 中的配置指令，用 C# 独立实现；未打包或分发原 Python 工具。
+- [Migration record](docs/MIGRATION.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [ImmortalWrt build](docs/BUILD_IMMORTALWRT.md)
+- [Device deployment](docs/DEVICE_DEPLOY.md)
+- [First boot collection](docs/DEVICE_FIRST_BOOT.md)
+- [First RM502Q-AE AT capture](docs/RM502QAE_FIRST_AT.md)
+- [Porting audit](docs/PORTING_AUDIT.md)
 
-## 网页设置 WebUI
+## License and attribution
 
-登录后进入 **系统设置**，可以修改 **Web 账号、Web 密码和 HTTP 端口**。修改需要填写当前 Web 密码；新密码留空可只修改账号，保存账号或密码后重新登录。系统 root 密码仍在独立区域修改。
-
-![WebUI 设置](docs/images/webui-settings.png)
-
-HTTP 端口保存后立即切换监听，无需重启模块。新端口被占用或无法保存时保留原端口。直接通过模块 IP 访问的用户可点击“打开新地址”；通过 ADB 转发的用户需要在安装器重新打开管理页面，以便建立指向新端口的转发。端口文件与安装器共用，重启后保持，相同设置不重复写 NAND。
-
-Windows 工具使用移远官网 Logo 作为适配品牌标识。Quectel 标识归移远通信所有，本工具由 Monologue&蓝天科技维护，非移远官方安装工具。
+This repository remains MIT licensed under [LICENSE](LICENSE). The port retains the baseline project’s attribution and the frontend license notices in `development/simpleadmin/www/licenses/`. Quectel trademarks belong to Quectel Wireless Solutions; this is not an official Quectel tool.

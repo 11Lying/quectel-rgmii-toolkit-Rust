@@ -7,8 +7,7 @@
     { id: 'network', selector: '#networkApp', factoryName: 'network', title: '网络' },
     { id: 'settings', selector: '#settingsApp', factoryName: 'settings', title: '设置' },
     { id: 'sms', selector: '#smsApp', factoryName: 'sms', title: '短信' },
-    { id: 'deviceinfo', selector: '#deviceinfoApp', factoryName: 'deviceinfo', title: '设备信息' },
-    { id: 'console', selector: null, factoryName: null, title: '控制台', frameSelector: '#consoleFrame', frameSrc: '/console' }
+    { id: 'deviceinfo', selector: '#deviceinfoApp', factoryName: 'deviceinfo', title: '设备信息' }
   ];
   const mountedPages = new Set();
   const revealTimers = new WeakMap();
@@ -186,14 +185,6 @@
   function mountPage(id) {
     if (mountedPages.has(id)) return;
     const page = getPage(id);
-    if (page.frameSelector) {
-      const frame = document.querySelector(page.frameSelector);
-      if (frame && !frame.getAttribute('src')) {
-        frame.setAttribute('src', frame.getAttribute('data-console-src') || page.frameSrc);
-      }
-      mountedPages.add(id);
-      return;
-    }
     const factory = root.Pages && root.Pages[page.factoryName];
     if (typeof factory !== 'function') {
       console.warn('SimpleAdmin page factory missing:', page.factoryName);

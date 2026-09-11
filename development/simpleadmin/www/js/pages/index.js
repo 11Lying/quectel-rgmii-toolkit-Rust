@@ -55,10 +55,6 @@ function getStaticNetworkInfo() {
     sinrLTEPercentage: 0,
     sinrNRPercentage: 0,
     signalPercentage: 0,
-    cpuUsagePercent: 0,
-    ramUsagePercent: 0,
-    ramUsedHuman: '-',
-    ramTotalHuman: '-',
     internetConnection: '未连接',
     lastUpdate: new Date().toLocaleString(),
     newRefreshRate: null,
@@ -127,9 +123,11 @@ function getStaticNetworkInfo() {
       return 'progress-bar bg-danger';
     },
 
-    resourceTone(value, warning, danger) {
-      if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'metric-neutral';
-      return Number(value) >= danger ? 'metric-bad' : Number(value) >= warning ? 'metric-warn' : 'metric-good';
+    getProgressBarClass(percentage) {
+      const value = Number(percentage);
+      if (value >= 60) return 'progress-bar bg-success';
+      if (value >= 40) return 'progress-bar bg-warning';
+      return 'progress-bar bg-danger';
     },
 
     clampPercent(value) {
@@ -145,13 +143,6 @@ function getStaticNetworkInfo() {
 
     formatPercent(value) {
       return `${this.clampPercent(value)}%`;
-    },
-
-    formatRamUsage() {
-      if (this.ramUsedHuman && this.ramUsedHuman !== '-' && this.ramTotalHuman && this.ramTotalHuman !== '-') {
-        return `${this.ramUsedHuman} / ${this.ramTotalHuman}`;
-      }
-      return this.t('获取中...');
     },
 
     fetchNetworkInfo() {
@@ -181,8 +172,7 @@ function getStaticNetworkInfo() {
         'drxqrsrp', 'rx2qrsrp', 'rx3qrsrp', 'earfcns', 'pcc_pci', 'scc_pci',
         'signalAssessment', 'csq', 'rssi', 'cellID', 'eNBID', 'tac',
         'rsrqLTE', 'rsrqNR', 'rsrpLTE', 'rsrpNR', 'sinrLTE', 'sinrNR',
-        'internetConnection', 'lastUpdate', 'nr_rx_human', 'nr_tx_human',
-        'ramUsedHuman', 'ramTotalHuman'
+        'internetConnection', 'lastUpdate', 'nr_rx_human', 'nr_tx_human'
       ];
 
       textKeys.forEach((key) => {
@@ -194,7 +184,7 @@ function getStaticNetworkInfo() {
       const percentKeys = [
         'rsrqLTEPercentage', 'rsrqNRPercentage', 'rsrpLTEPercentage',
         'rsrpNRPercentage', 'sinrLTEPercentage', 'sinrNRPercentage',
-        'signalPercentage', 'cpuUsagePercent', 'ramUsagePercent'
+        'signalPercentage'
       ];
       percentKeys.forEach((key) => {
         if (Object.prototype.hasOwnProperty.call(data, key)) {
@@ -274,8 +264,6 @@ function getStaticNetworkInfo() {
         internetConnection: '未连接',
         nr_rx_human: '-',
         nr_tx_human: '-',
-        ramUsedHuman: '-',
-        ramTotalHuman: '-',
         rsrqLTEPercentage: 0,
         rsrqNRPercentage: 0,
         rsrpLTEPercentage: 0,
@@ -283,8 +271,6 @@ function getStaticNetworkInfo() {
         sinrLTEPercentage: 0,
         sinrNRPercentage: 0,
         signalPercentage: 0,
-        cpuUsagePercent: 0,
-        ramUsagePercent: 0,
         nr_rx_bytes: 0,
         nr_tx_bytes: 0
       });
@@ -438,25 +424,6 @@ function getStaticNetworkInfo() {
         .then((response) => response.text())
         .then((data) => this.setUptimeParts(this.parseUptimeParts(data)))
         .catch(() => this.setUptimeParts(null));
-    },
-
-    requestPing() {
-      return SimpleAdmin.Api.getPing().then((response) => response.text());
-    },
-
-    requestPingWithTimeout(timeout = 5000) {
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Ping request timed out')), timeout);
-        this.requestPing()
-          .then((res) => {
-            clearTimeout(timer);
-            resolve(res);
-          })
-          .catch((err) => {
-            clearTimeout(timer);
-            reject(err);
-          });
-      });
     }
   };
 }

@@ -23,10 +23,7 @@ impl std::fmt::Debug for SavedError {
 impl std::fmt::Display for SavedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.committed {
-            write!(
-                f,
-                "settings written but durability/read-only restoration failed: "
-            )?
+            write!(f, "settings written but durability failed: ")?
         }
         self.error.fmt(f)
     }
@@ -35,13 +32,9 @@ impl std::error::Error for SavedError {}
 
 impl Store {
     pub fn new(mock: bool) -> Self {
-        let managed = !mock
-            && cfg!(target_os = "linux")
-            && std::env::var("SIMPLEADMIN_MANAGE_ROOTFS")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or_else(|_| Path::new("/dev/smd11").exists());
+        let _ = mock;
         Self {
-            managed,
+            managed: false,
             lock: Mutex::new(()),
         }
     }
@@ -89,9 +82,6 @@ impl Store {
         }
         let mut committed = false;
         let result = (|| -> Result<()> {
-            if self.managed {
-                remount(true)?
-            }
             let parent = path.parent().context("missing settings directory")?;
             fs::create_dir_all(parent)?;
             let temp = parent.join(format!(
@@ -120,44 +110,13 @@ impl Store {
             let _ = fs::remove_file(&temp);
             result
         })();
-        let restored = if self.managed { remount(false) } else { Ok(()) };
-        match (result, restored) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(SavedError { committed, error }),
-            (Err(first), Err(second)) => Err(SavedError {
-                committed,
-                error: anyhow::anyhow!("{first}; {second}"),
-            }),
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(SavedError { committed, error }),
         }
     }
 }
 
-fn remount(writable: bool) -> Result<()> {
-    let mut child = std::process::Command::new("mount")
-        .args([
-            "-o",
-            if writable { "remount,rw" } else { "remount,ro" },
-            "/",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
-            }
-            bail!("root remount {} failed", if writable { "rw" } else { "ro" })
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("root remount timed out")
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 #[cfg(unix)]
 fn process_lock() -> Result<File> {
     use std::{os::fd::AsRawFd, os::unix::fs::OpenOptionsExt};

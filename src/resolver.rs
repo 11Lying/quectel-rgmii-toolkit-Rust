@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 type Pending = (String, oneshot::Receiver<Option<Vec<IpAddr>>>);
 
 #[derive(Clone, Default)]
-pub struct HttpResolver(std::sync::Arc<tokio::sync::Mutex<PingResolver>>);
+pub struct HttpResolver(std::sync::Arc<tokio::sync::Mutex<DnsResolver>>);
 
 impl reqwest::dns::Resolve for HttpResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -29,13 +29,13 @@ impl reqwest::dns::Resolve for HttpResolver {
 }
 
 #[derive(Default)]
-pub struct PingResolver {
+pub struct DnsResolver {
     pending: Option<Pending>,
     cached: Option<(String, Vec<IpAddr>, Instant)>,
     retry: Option<(String, Instant)>,
 }
 
-impl PingResolver {
+impl DnsResolver {
     pub async fn resolve(
         &mut self,
         target: &str,
@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_retains_one_lookup_and_discards_old_target_result() {
         let (tx, rx) = oneshot::channel();
-        let mut resolver = PingResolver {
+        let mut resolver = DnsResolver {
             pending: Some(("old.test".into(), rx)),
             ..Default::default()
         };
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn failed_query_backs_off_then_allows_recovery() {
         let (tx, rx) = oneshot::channel();
-        let mut resolver = PingResolver {
+        let mut resolver = DnsResolver {
             pending: Some(("host.test".into(), rx)),
             ..Default::default()
         };

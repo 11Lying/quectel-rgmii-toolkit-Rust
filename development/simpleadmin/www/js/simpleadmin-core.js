@@ -184,34 +184,8 @@
       smsData(params = {}) {
         return this.postJSON('/api/sms_data', params);
       },
-      getAT(atcmd, options = {}) {
-        const params = new URLSearchParams({ atcmd });
-        if (options.force) params.set('force', '1');
-        if (options.wait !== undefined) params.set('wait', options.wait ? '1' : '0');
-        return request('/api/get_atcache', {
-          method: 'POST',
-          cache: 'no-store',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-          body: params
-        });
-      },
-      refreshAT(atcmd) {
-        return this.getAT(atcmd, { force: true, wait: true });
-      },
-      getATText(atcmd, options = {}) {
-        return this.getAT(atcmd, options).then((response) => response.text());
-      },
       getUptime() {
         return request('/api/get_uptime');
-      },
-      getPing() {
-        return request('/api/get_ping');
-      },
-      getTTLStatus() {
-        return request('/api/get_ttl_status');
-      },
-      setTTL(ttlvalue) {
-        return request(this.url('/api/set_ttl', { ttlvalue }));
       },
       getLanguage() {
         return request('/api/get_language', { cache: 'no-store' });

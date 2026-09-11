@@ -109,10 +109,10 @@ fn envelope(command: &str, raw: &str) -> String {
     raw.replace('\n', "\r\n") + "\r\n"
 }
 pub async fn handle(at: &At, p: &Params) -> Result<Value> {
+    let action = p.get("action");
     if !at.mock {
         bail!("mock mode only")
     }
-    let action = p.get("action");
     match action {
         "set" | "save" => {
             let key = kind(p.get("kind"))
